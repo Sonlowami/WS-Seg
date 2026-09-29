@@ -39,6 +39,39 @@ def build_scheduler(optimizer, scheduler_cfg: dict, total_epochs: int):
     raise ValueError(f"Unknown scheduler: {scheduler_cfg['name']}")
 
 
+def resolve_device(name=None) -> torch.device:
+    if name in (None, "auto"):
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device(name)
+
+
+def sample_points(coords, target, n_points=None, requires_grad=False):
+    """
+    Random voxel subset for one optimization step.
+
+    A whole volume at 1 mm isotropic is ~10^8 voxels; pushing it through the
+    INR with autograd needs hidden_dim floats per voxel per layer (~90 GB per
+    layer at hidden_dim=256), so every step fits a random batch instead.
+    Sampling with replacement (randint) avoids a full permutation each step.
+    Both losses are per-point means with scalar kwargs, so a subset is an
+    unbiased estimate of the full-volume loss.
+    """
+    if n_points is not None and n_points < coords.shape[0]:
+        idx = torch.randint(coords.shape[0], (n_points,), device=coords.device)
+        coords, target = coords[idx], target[idx]
+    # detach(): the sampled coords must be a leaf for the Eikonal gradient.
+    return coords.detach().requires_grad_(requires_grad), target
+
+
+@torch.no_grad()
+def predict_in_chunks(model, coords, chunk_size: int = 2 ** 20) -> torch.Tensor:
+    """Full-volume prediction without autograd, returned on CPU for metrics."""
+    return torch.cat([model.forward(coords[i:i + chunk_size]).cpu()
+                      for i in range(0, coords.shape[0], chunk_size)])
+
+
+
+
 def train_encoder_decoder(
     dataloader,
     model: EncoderDecoderINR,
@@ -51,12 +84,20 @@ def train_encoder_decoder(
     epoch_count: int,
     log_every_n_epochs: int,
     wandb_run,
+    points_per_step: int = None,      # random voxels per step; None = whole volume
+    eval_chunk_size: int = 2 ** 20,   # voxels per no-grad forward when logging metrics
+    device=None,                      # "auto"/None -> cuda if available
 ):
     """
     Trains one shared encoder across the full dataloader, fitting (and
     discarding) a fresh decoder per case. Returns the trained encoder's
     state_dict; decoders are intentionally not retained past their own case.
+
+    Each "epoch" is one optimizer step on a random batch of points_per_step
+    voxels (see sample_points). Metrics are computed on the full volume.
     """
+    device = resolve_device(device)
+    model.to(device)
     global_step = 0
 
     for case in dataloader:
@@ -66,27 +107,30 @@ def train_encoder_decoder(
         # built once from the first case would be wrong for the rest.
         coords, shape = coords_fn(case)
         target, extra = target_extractor(case)
+        coords, target_dev = coords.to(device), target.to(device)
+        needs_coord_grad = extra.get("needs_coord_grad", False)
 
         params = list(model.encoder_parameters()) + list(model.decoder_parameters())
         optimizer = build_optimizer(params, optimizer_cfg)
         scheduler = build_scheduler(optimizer, scheduler_cfg, epoch_count)
 
-        coords_case = coords.clone().requires_grad_(extra.get("needs_coord_grad", False))
-
         for epoch in range(epoch_count):
             optimizer.zero_grad()
-            pred = model.forward(coords_case)
-            loss_dict = loss_fn(pred, coords_case, target, **extra.get("loss_kwargs", {}))
+            coords_batch, target_batch = sample_points(
+                coords, target_dev, points_per_step, requires_grad=needs_coord_grad)
+            pred = model.forward(coords_batch)
+            loss_dict = loss_fn(pred, coords_batch, target_batch, **extra.get("loss_kwargs", {}))
             loss_dict["total"].backward()
             optimizer.step()
             scheduler.step()
 
             if epoch % log_every_n_epochs == 0:
-                with torch.no_grad():
-                    metrics = metric_fn(pred.detach(), target, shape)
+                full_pred = predict_in_chunks(model, coords, eval_chunk_size)
+                metrics = metric_fn(full_pred, target, shape)
                 metrics.update({f"loss/{k}": v for k, v in loss_dict.items() if k != "total"})
                 metrics["loss/total"] = loss_dict["total"].detach()
                 wandb_log(wandb_run, metrics, step=global_step)
             global_step += 1
 
+        del coords, target_dev
     return model.encoder_state_dict()

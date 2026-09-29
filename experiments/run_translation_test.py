@@ -43,7 +43,9 @@ from sdf.coordinates import get_3d_coordinates
 from sdf.targets import create_multilabel_sdf, sdf_to_channel_masks
 from models.interfaces import build_model
 from training.losses import masked_eikonal_sdf_loss
-from training.train_loop import build_optimizer, build_scheduler
+from training.train_loop import (
+    build_optimizer, build_scheduler, resolve_device, sample_points, predict_in_chunks,
+)
 
 
 def fit_decoder_and_eval(encoder_state_dict: dict, task_cfg: dict, label_groups: list,
@@ -52,28 +54,31 @@ def fit_decoder_and_eval(encoder_state_dict: dict, task_cfg: dict, label_groups:
     alpha, eikonal_lambda = sdf_cfg["alpha"], sdf_cfg["eikonal_lambda"]
     decode_mode = sdf_cfg.get("decode_mode", "independent")
 
-    model = build_model(task_cfg["model"], out_features=len(label_groups))
+    train_cfg = task_cfg["training"]
+    device = resolve_device(train_cfg.get("device", "auto"))
+    model = build_model(task_cfg["model"], out_features=len(label_groups)).to(device)
     model.load_encoder_state_dict(encoder_state_dict, freeze=True)
     model.reset_decoder()
 
     label_map = case["mask"].squeeze().cpu().numpy()
     sdf_np = create_multilabel_sdf(label_map, label_groups, spacing_mm, alpha)
-    target = torch.from_numpy(sdf_np).reshape(-1, sdf_np.shape[-1]).float()
+    target = torch.from_numpy(sdf_np).reshape(-1, sdf_np.shape[-1]).float().to(device)
+    coords = coords.to(device)
 
-    coords_case = coords.clone().requires_grad_(True)
     optimizer = build_optimizer(model.decoder_parameters(), task_cfg["optimizer"])
     scheduler = build_scheduler(optimizer, task_cfg["scheduler"], steps)
 
     for _ in range(steps):
         optimizer.zero_grad()
-        pred = model.forward(coords_case)
-        loss_dict = masked_eikonal_sdf_loss(pred, coords_case, target, alpha, eikonal_lambda)
+        coords_batch, target_batch = sample_points(
+            coords, target, train_cfg.get("points_per_step"), requires_grad=True)
+        pred = model.forward(coords_batch)
+        loss_dict = masked_eikonal_sdf_loss(pred, coords_batch, target_batch, alpha, eikonal_lambda)
         loss_dict["total"].backward()
         optimizer.step()
         scheduler.step()
 
-    with torch.no_grad():
-        pred_final = model.forward(coords_case.detach())
+    pred_final = predict_in_chunks(model, coords, train_cfg.get("eval_chunk_size", 2 ** 20))
 
     shape = tuple(case["mask"].shape[-3:])
     k = len(label_groups)

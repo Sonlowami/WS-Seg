@@ -87,6 +87,9 @@ def main():
         epoch_count=cfg["training"]["epochs"],
         log_every_n_epochs=cfg["training"]["log_every_n_epochs"],
         wandb_run=wandb_run,
+        points_per_step=cfg["training"].get("points_per_step"),
+        eval_chunk_size=cfg["training"].get("eval_chunk_size", 2 ** 20),
+        device=cfg["training"].get("device", "auto"),
     )
 
     save_encoder_weights(encoder_state_dict, cfg, out_dir=f"checkpoints/{cfg['experiment_name']}")
