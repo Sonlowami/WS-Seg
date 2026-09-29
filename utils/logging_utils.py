@@ -1,10 +1,14 @@
 """Thin wandb wrapper so the training loop doesn't import wandb directly
 (keeps it importable/testable in environments without wandb configured)."""
+from dotenv import load_dotenv
 
+load_dotenv()
 
 def configure_wandb(wandb_cfg: dict, experiment_name: str, full_config: dict):
     try:
         import wandb
+        import os
+        wandb.login(key=os.environ.get("WANDB_API_KEY"))
     except ImportError:
         print("wandb not installed; logging to stdout only.")
         return None
