@@ -1,5 +1,7 @@
+import torch
+import torch.nn as nn
 from .interfaces import EncoderDecoderINR
-from alpine.models.strainer import Strainer
+from alpine.models.strainer import Strainer, get_linear_layer
 
 class STRAINER_INR(Strainer, EncoderDecoderINR):
     def forward(self, coords):
@@ -12,10 +14,22 @@ class STRAINER_INR(Strainer, EncoderDecoderINR):
         return list(self.decoder.parameters())
 
     def reset_decoder(self) -> None:
-        for module in self.decoder.modules():
-            reset_parameters = getattr(module, "reset_parameters", None)
-            if reset_parameters is not None:
-                reset_parameters()
+        # nn.Linear.reset_parameters() would apply PyTorch's default init, not
+        # SIREN's, so copy in weights from fresh layers built by Alpine's own
+        # initializer instead (same omegas and first/last-layer rules).
+        with torch.no_grad():
+            for decoder in self.decoder:
+                linears = [m for m in decoder if isinstance(m, nn.Linear)]
+                for j, layer in enumerate(linears):
+                    fresh = get_linear_layer(
+                        layer.in_features, layer.out_features,
+                        omega=self.omegas[len(self.omegas) - len(linears) + j],
+                        bias=layer.bias is not None,
+                        is_last=(j == len(linears) - 1),
+                    )
+                    layer.weight.copy_(fresh.weight)
+                    if layer.bias is not None:
+                        layer.bias.copy_(fresh.bias)
 
     def encoder_state_dict(self) -> dict:
         return self.encoder.state_dict()

@@ -42,18 +42,34 @@ class EncoderDecoderINR(Protocol):
 
 def build_model(model_cfg: dict, out_features: int) -> EncoderDecoderINR:
     """
-    Factory for an EncoderDecoderINR from the `model:` block of the training
-    config. This is the one place a concrete architecture needs to be wired
-    in -- e.g. Alpine's `alpine.models.Strainer`.
+    Build an EncoderDecoderINR from the `model:` block of the training config.
+    This is the one place a concrete architecture is wired in; it wraps
+    Alpine's `Strainer` (see models/strainer_inr.py).
 
-    Raises NotImplementedError until a concrete backend is plugged in, so
-    the rest of the pipeline (data, losses, metrics, training loop, the
-    translation test) can be built and unit-tested independently of that
-    decision.
+    model_cfg keys:
+        encoder_layers  shared layers kept across images
+        decoder_layers  per-image layers, re-initialized for each case
+        hidden_dim      width of every hidden layer
+        omega           optional SIREN frequency, default 30.0
+    Inputs are always 3-D coordinates; out_features is the target width
+    (image channels for Encoder I, label groups for Encoder II).
     """
-    raise NotImplementedError(
-        "Wire a concrete EncoderDecoderINR here, e.g. by wrapping "
-        "alpine.models.Strainer(encoder_layers=model_cfg['encoder_layers'], "
-        "decoder_layers=model_cfg['decoder_layers'], hidden_dim=model_cfg['hidden_dim'], "
-        f"out_features={out_features}) so it satisfies EncoderDecoderINR above."
+    # Imported here: strainer_inr imports this module for the Protocol.
+    from models.strainer_inr import STRAINER_INR
+
+    encoder_layers = model_cfg["encoder_layers"]
+    decoder_layers = model_cfg["decoder_layers"]
+    if encoder_layers < 1 or decoder_layers < 1:
+        raise ValueError(
+            f"Need at least one encoder and one decoder layer, got "
+            f"encoder_layers={encoder_layers}, decoder_layers={decoder_layers}"
+        )
+    return STRAINER_INR(
+        in_features=3,
+        hidden_features=model_cfg["hidden_dim"],
+        hidden_layers=encoder_layers + decoder_layers,
+        out_features=out_features,
+        num_shared_layers=encoder_layers,
+        num_decoders=1,     # one decoder at a time; replaced per case
+        omegas=[float(model_cfg.get("omega", 30.0))],
     )

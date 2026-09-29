@@ -5,5 +5,5 @@ scipy
 scikit-image
 pyyaml
 wandb
-# Not pinned as a hard dependency yet -- see models/interfaces.py build_model():
-# alpine @ git+https://github.com/kushalvyas/alpine.git@<pin-a-commit>
+# Strainer backend for models/interfaces.py build_model()
+alpine @ git+https://github.com/kushalvyas/alpine.git@14a96fbc1f1124d3883a325042991a45b38c063d
