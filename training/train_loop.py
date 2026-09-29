@@ -19,6 +19,10 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
 from models.interfaces import EncoderDecoderINR
 from utils.logging_utils import log as wandb_log
 
+# Used when a config has no training.points_per_step. Never default to the
+# whole volume: a single 1 mm CT is ~3e7-1e8 voxels, far beyond GPU memory.
+DEFAULT_POINTS_PER_STEP = 2 ** 18
+
 
 def build_optimizer(params, optimizer_cfg: dict):
     if optimizer_cfg["name"] == "adamw":
