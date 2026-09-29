@@ -22,7 +22,15 @@ def configure_wandb(wandb_cfg: dict, experiment_name: str, full_config: dict):
     )
 
 
+def _to_scalar(v):
+    # Tensors (including MONAI MetaTensors) and numpy scalars -> plain floats;
+    # wandb's JSON encoder does not know tensor subclasses.
+    item = getattr(v, "item", None)
+    return item() if callable(item) else v
+
+
 def log(run, metrics: dict, step: int):
+    metrics = {k: _to_scalar(v) for k, v in metrics.items()}
     if run is not None:
         run.log(metrics, step=step)
     else:

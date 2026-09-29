@@ -45,6 +45,7 @@ from models.interfaces import build_model
 from training.losses import masked_eikonal_sdf_loss
 from training.train_loop import (
     build_optimizer, build_scheduler, resolve_device, sample_points, predict_in_chunks,
+    DEFAULT_POINTS_PER_STEP,
 )
 
 
@@ -71,7 +72,7 @@ def fit_decoder_and_eval(encoder_state_dict: dict, task_cfg: dict, label_groups:
     for _ in range(steps):
         optimizer.zero_grad()
         coords_batch, target_batch = sample_points(
-            coords, target, train_cfg.get("points_per_step"), requires_grad=True)
+            coords, target, train_cfg.get("points_per_step", DEFAULT_POINTS_PER_STEP), requires_grad=True)
         pred = model.forward(coords_batch)
         loss_dict = masked_eikonal_sdf_loss(pred, coords_batch, target_batch, alpha, eikonal_lambda)
         loss_dict["total"].backward()

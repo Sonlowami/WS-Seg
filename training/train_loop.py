@@ -84,7 +84,7 @@ def train_encoder_decoder(
     epoch_count: int,
     log_every_n_epochs: int,
     wandb_run,
-    points_per_step: int = None,      # random voxels per step; None = whole volume
+    points_per_step: int = DEFAULT_POINTS_PER_STEP,  # random voxels per step; None = whole volume
     eval_chunk_size: int = 2 ** 20,   # voxels per no-grad forward when logging metrics
     device=None,                      # "auto"/None -> cuda if available
 ):
@@ -98,6 +98,8 @@ def train_encoder_decoder(
     """
     device = resolve_device(device)
     model.to(device)
+    print(f"train_encoder_decoder: device={device}, points_per_step="
+          f"{points_per_step or 'whole volume'}, eval_chunk_size={eval_chunk_size}")
     global_step = 0
 
     for case in dataloader:
@@ -107,6 +109,11 @@ def train_encoder_decoder(
         # built once from the first case would be wrong for the rest.
         coords, shape = coords_fn(case)
         target, extra = target_extractor(case)
+        # MONAI MetaTensor -> plain tensor: metadata would otherwise be carried
+        # through every op in the loop (slower) and into the logged losses,
+        # which wandb cannot serialize.
+        if hasattr(target, "as_tensor"):
+            target = target.as_tensor()
         coords, target_dev = coords.to(device), target.to(device)
         needs_coord_grad = extra.get("needs_coord_grad", False)
 

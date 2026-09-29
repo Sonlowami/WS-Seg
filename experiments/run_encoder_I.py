@@ -15,7 +15,7 @@ from data.msd import load_tasks, shared_image_channels
 from sdf.coordinates import get_3d_coordinates
 from models.interfaces import build_model
 from training.losses import image_reconstruction_loss
-from training.train_loop import train_encoder_decoder
+from training.train_loop import train_encoder_decoder, DEFAULT_POINTS_PER_STEP
 
 
 def target_extractor(case):
@@ -87,7 +87,7 @@ def main():
         epoch_count=cfg["training"]["epochs"],
         log_every_n_epochs=cfg["training"]["log_every_n_epochs"],
         wandb_run=wandb_run,
-        points_per_step=cfg["training"].get("points_per_step"),
+        points_per_step=cfg["training"].get("points_per_step", DEFAULT_POINTS_PER_STEP),
         eval_chunk_size=cfg["training"].get("eval_chunk_size", 2 ** 20),
         device=cfg["training"].get("device", "auto"),
     )
