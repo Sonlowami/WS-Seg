@@ -1,0 +1,66 @@
+# Experiment 1 training config
+# Two variants of this file are expected to exist:
+#   config/encoder_I_intensity.yaml   (Encoder I, trained on image intensities)
+#   config/encoder_II_sdf.yaml        (Encoder II, trained on clipped mask SDFs)
+# Keep both checkpointed alongside their config (see utils/io.py) so it is
+# always traceable which alpha/loss produced which weights.
+
+experiment_name: "encoder_I_intensity"   # or "encoder_II_sdf"
+target_signal: "intensity"               # "intensity" | "sdf"
+
+data:
+  # Folder containing Task*/dataset.json (the extracted MSD tarballs). Every file
+  # list, label name and modality is read from each task's own dataset.json;
+  # image channels and (by default) label groups are derived from it.
+  root: "/path/to/Decathlon"
+  tasks: ["Task03_Liver"]                # one or more task folders under root
+  spacing_mm: [1.0, 1.0, 1.0]            # isometric spacing
+  normalization: "z-norm"                # z-score normalize intensities
+  # dataset.json has no held-out split (MSD test images ship without labels), so
+  # val/test are carved out of its "training" list. Generated once from the seed,
+  # saved to splits_dir/<task>.json, then reused; reuse those files for the
+  # nnU-Net and Meta-Seg baselines so every model sees identical splits.
+  splits_dir: "splits"
+  split: {train: 0.8, val: 0.1, test: 0.1, seed: 42}
+
+model:
+  encoder_layers: 4
+  decoder_layers: 2
+  hidden_dim: 256
+
+optimizer:
+  name: "adam"                           # adam | adamw
+  initial_lr: 1.0e-4
+  weight_decay: 0.0                      # only used if optimizer != adamw
+
+scheduler:
+  name: "cosine"                         # linear | cosine
+
+training:
+  epochs: 1000
+  log_every_n_epochs: 100
+
+# Only used when target_signal == "sdf". Kept explicit and versioned with the
+# checkpoint so Encoder I and Encoder II are never silently compared under
+# mismatched loss settings.
+sdf:
+  alpha: 5.0                             # clipping distance, mm
+  eikonal_lambda: 0.1
+  # Output channels. Label ids are validated against each task's dataset.json.
+  #   "auto"                       one exclusive channel per non-background label
+  #   [[1]]                        single channel from label 1
+  #   [[1], [2]]                   exclusive channels (e.g. organ, tumour)
+  #   [[1, 2, 3], [2, 3], [3]]     BraTS-style nested regions
+  #   [["foreground"]]             one channel: any non-background label. Use this
+  #                                to train a shared encoder across tasks with
+  #                                different label sets.
+  # The resolved per-task groups are saved with the checkpoint.
+  label_groups: "auto"
+  # "independent": threshold each channel at 0 (use for nested/overlapping regions)
+  # "exclusive":   argmin over channels (use only when label_groups are disjoint)
+  decode_mode: "independent"
+
+wandb:
+  entity: "TODO-entity"
+  project: "wsl-experiment1"
+  run_name: null                         # fall back to experiment_name if null

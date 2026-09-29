@@ -1,0 +1,31 @@
+"""
+MONAI dataset built directly from MSD dataset.json files (see data/msd.py).
+No manifest CSV: file lists, labels, and modalities come from each task's own
+dataset.json, and splits come from the persisted, seeded split files.
+"""
+from monai.data import Dataset as MonaiDataset
+
+from data.msd import load_tasks, load_or_create_splits
+from data.transforms import build_transforms
+
+
+def build_dataset(data_cfg: dict, split: str):
+    """
+    data_cfg: the `data:` block of the training config.
+    split: "train" | "val" | "test"
+    Returns a MONAI Dataset yielding dicts with image, mask, case_id, task.
+    """
+    if split not in ("train", "val", "test"):
+        raise ValueError(f"Unknown split: {split!r}")
+
+    entries = []
+    for task in load_tasks(data_cfg):
+        splits = load_or_create_splits(task, data_cfg["split"], data_cfg["splits_dir"])
+        wanted = set(splits[split])
+        entries += [c for c in task.cases if c["case_id"] in wanted]
+
+    if not entries:
+        raise ValueError(f"No cases found for split={split!r} in tasks {data_cfg['tasks']}")
+
+    transforms = build_transforms(tuple(data_cfg["spacing_mm"]))
+    return MonaiDataset(data=entries, transform=transforms)
