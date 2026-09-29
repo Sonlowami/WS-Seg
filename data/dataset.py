@@ -5,14 +5,16 @@ dataset.json, and splits come from the persisted, seeded split files.
 """
 from monai.data import Dataset as MonaiDataset
 
-from data.msd import load_tasks, load_or_create_splits
+from data.msd import load_tasks, load_or_create_splits, expand_by_modality
 from data.transforms import build_transforms
 
 
-def build_dataset(data_cfg: dict, split: str):
+def build_dataset(data_cfg: dict, split: str, per_modality: bool = False):
     """
     data_cfg: the `data:` block of the training config.
     split: "train" | "val" | "test"
+    per_modality: yield one single-channel item per (case, modality) instead of
+        one multi-channel item per case (see data.msd.expand_by_modality).
     Returns a MONAI Dataset yielding dicts with image, mask, case_id, task.
     """
     if split not in ("train", "val", "test"):
@@ -22,10 +24,13 @@ def build_dataset(data_cfg: dict, split: str):
     for task in load_tasks(data_cfg):
         splits = load_or_create_splits(task, data_cfg["split"], data_cfg["splits_dir"])
         wanted = set(splits[split])
-        entries += [c for c in task.cases if c["case_id"] in wanted]
+        selected = [c for c in task.cases if c["case_id"] in wanted]
+        if per_modality:
+            selected = expand_by_modality(selected, task.modalities)
+        entries += selected
 
     if not entries:
         raise ValueError(f"No cases found for split={split!r} in tasks {data_cfg['tasks']}")
 
-    transforms = build_transforms(tuple(data_cfg["spacing_mm"]))
+    transforms = build_transforms(tuple(data_cfg["spacing_mm"]), select_channel=per_modality)
     return MonaiDataset(data=entries, transform=transforms)

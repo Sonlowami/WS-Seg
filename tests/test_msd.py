@@ -6,6 +6,7 @@ from pathlib import Path
 from data.msd import (
     read_task_info, make_splits, load_or_create_splits,
     resolve_label_groups, resolve_shared_label_groups, shared_image_channels,
+    expand_by_modality,
 )
 
 SPLIT_CFG = {"train": 0.7, "val": 0.1, "test": 0.2, "seed": 42}
@@ -154,6 +155,32 @@ def test_mixed_image_channels_rejected():
             pass
         else:
             raise AssertionError("mixed channel counts must be rejected")
+
+
+def test_expand_by_modality_keeps_splits_case_level():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        ct = read_task_info(_make_task(root, "CT", 10, {"0": "bg", "1": "x"}, {"0": "CT"}))
+        mr = read_task_info(_make_task(root, "MR", 10, {"0": "bg", "1": "x"},
+                                       {"0": "T2", "1": "ADC"}))
+
+        ct_items = expand_by_modality(ct.cases, ct.modalities)
+        mr_items = expand_by_modality(mr.cases, mr.modalities)
+        assert len(ct_items) == 10 and len(mr_items) == 20
+        assert {i["channel"] for i in ct_items} == {0}
+        first = [i for i in mr_items if i["image"] == mr.cases[0]["image"]]
+        assert [(i["channel"], i["modality"]) for i in first] == [(0, "T2"), (1, "ADC")]
+        assert first[0]["case_id"] == f"{mr.cases[0]['case_id']}/T2"
+        assert len({i["case_id"] for i in mr_items}) == 20
+
+        # Expansion happens after split lookup: every modality of a case
+        # inherits that case's split, so no case straddles train and test.
+        splits = load_or_create_splits(mr, SPLIT_CFG, root / "splits")
+        test_ids = set(splits["test"])
+        test_items = expand_by_modality(
+            [c for c in mr.cases if c["case_id"] in test_ids], mr.modalities)
+        assert {i["case_id"].rsplit("/", 1)[0] for i in test_items} == test_ids
+        assert len(test_items) == 2 * len(test_ids)
 
 
 if __name__ == "__main__":

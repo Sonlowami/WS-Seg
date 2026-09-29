@@ -54,9 +54,16 @@ def main():
     )
 
     spacing_mm = tuple(cfg["data"]["spacing_mm"])
-    channels = shared_image_channels(load_tasks(cfg["data"]))   # derived from dataset.json
+    # The encoder sees only coordinates; image channels set only the decoder
+    # width. per_modality fits each modality as its own 1-channel image, so
+    # tasks with different modalities (CT vs [T2, ADC]) can share one encoder.
+    per_modality = cfg["data"].get("per_modality", True)
+    if per_modality:
+        channels = 1
+    else:
+        channels = shared_image_channels(load_tasks(cfg["data"]))   # derived from dataset.json
 
-    dataset = build_dataset(cfg["data"], split="train")
+    dataset = build_dataset(cfg["data"], split="train", per_modality=per_modality)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
 
     model = build_model(cfg["model"], out_features=channels)
@@ -71,7 +78,7 @@ def main():
         model=model,
         coords_fn=coords_fn,
         target_extractor=target_extractor,
-        loss_fn=lambda pred, target: {
+        loss_fn=lambda pred, coords, target: {
             "total": image_reconstruction_loss(pred, target)
         },
         metric_fn=lambda pred, target, shape: metric_fn(pred, target, shape, channels),

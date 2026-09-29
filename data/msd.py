@@ -221,6 +221,25 @@ def shared_image_channels(tasks: list) -> int:
     if len(set(counts.values())) > 1:
         raise ValueError(
             f"Tasks have different numbers of image channels {counts}; "
-            f"a single run currently needs them to match."
+            f"set data.per_modality: true to train on them together."
         )
     return next(iter(counts.values()))
+
+
+# ---------------------------------------------------------------- modalities
+
+def expand_by_modality(cases: list, modalities: list) -> list:
+    """
+    One entry per (case, modality), each carrying the `channel` index to keep.
+
+    The encoder sees only coordinates, so image channels only set the width of
+    the per-case decoder. Splitting every modality into its own single-channel
+    target lets tasks with different modalities (e.g. CT vs [T2, ADC]) share
+    one encoder with out_features=1. Expand AFTER split lookup so that all
+    modalities of a case stay in the same split.
+    """
+    return [
+        {**c, "case_id": f"{c['case_id']}/{m}", "channel": i, "modality": m}
+        for c in cases
+        for i, m in enumerate(modalities)
+    ]
