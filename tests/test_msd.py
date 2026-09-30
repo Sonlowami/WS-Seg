@@ -6,7 +6,7 @@ from pathlib import Path
 from data.msd import (
     read_task_info, make_splits, load_or_create_splits,
     resolve_label_groups, resolve_shared_label_groups, shared_image_channels,
-    expand_by_modality,
+    expand_by_modality, expand_by_label_group, resolve_label_groups_per_task,
 )
 
 SPLIT_CFG = {"train": 0.7, "val": 0.1, "test": 0.2, "seed": 42}
@@ -181,6 +181,32 @@ def test_expand_by_modality_keeps_splits_case_level():
             [c for c in mr.cases if c["case_id"] in test_ids], mr.modalities)
         assert {i["case_id"].rsplit("/", 1)[0] for i in test_items} == test_ids
         assert len(test_items) == 2 * len(test_ids)
+
+
+def test_per_label_expansion_handles_different_label_sets():
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        liver = read_task_info(_make_task(root, "Liver", 10,
+                                          {"0": "bg", "1": "liver", "2": "cancer"}, {"0": "CT"}))
+        spleen = read_task_info(_make_task(root, "Spleen", 10,
+                                           {"0": "bg", "1": "spleen"}, {"0": "CT"}))
+
+        by_task = resolve_label_groups_per_task("auto", [liver, spleen])
+        assert by_task == {"Liver": [[1], [2]], "Spleen": [[1]]}
+
+        liver_items = expand_by_label_group(liver.cases, by_task["Liver"], liver.labels)
+        spleen_items = expand_by_label_group(spleen.cases, by_task["Spleen"], spleen.labels)
+        assert len(liver_items) == 20 and len(spleen_items) == 10
+        first = liver_items[:2]
+        assert [(i["label_group"], i["label_group_name"]) for i in first] == \
+            [(0, "liver"), (1, "cancer")]
+        assert first[1]["case_id"] == f"{liver.cases[0]['case_id']}/cancer"
+        assert first[0]["mask"] == liver.cases[0]["mask"]
+
+        nested = resolve_label_groups_per_task([["foreground"], [2]], [liver])["Liver"]
+        names = [i["label_group_name"]
+                 for i in expand_by_label_group(liver.cases[:1], nested, liver.labels)]
+        assert names == ["liver+cancer", "cancer"]
 
 
 if __name__ == "__main__":

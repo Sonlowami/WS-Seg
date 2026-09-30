@@ -198,20 +198,25 @@ def resolve_label_groups(spec, task: TaskInfo) -> list:
     return groups
 
 
+def resolve_label_groups_per_task(spec, tasks: list) -> dict:
+    """{task name: resolved groups}. Channel counts may differ between tasks."""
+    return {t.name: resolve_label_groups(spec, t) for t in tasks}
+
+
 def resolve_shared_label_groups(spec, tasks: list) -> dict:
     """
     Resolve per task, and require every task to yield the same number of
     channels, since one model (fixed decoder width) trains across all of them.
-    Use [["foreground"]] to train a shared encoder across tasks with different
-    label sets.
+    Use [["foreground"]], or sdf.per_label: true (see expand_by_label_group),
+    to train a shared encoder across tasks with different label sets.
     """
-    by_task = {t.name: resolve_label_groups(spec, t) for t in tasks}
+    by_task = resolve_label_groups_per_task(spec, tasks)
     counts = {name: len(g) for name, g in by_task.items()}
     if len(set(counts.values())) > 1:
         raise ValueError(
             f"Tasks resolve to different channel counts {counts}. Use an "
             f"explicit spec such as [[\"foreground\"]] that gives every task "
-            f"the same number of channels."
+            f"the same number of channels, or set sdf.per_label: true."
         )
     return by_task
 
@@ -242,4 +247,23 @@ def expand_by_modality(cases: list, modalities: list) -> list:
         {**c, "case_id": f"{c['case_id']}/{m}", "channel": i, "modality": m}
         for c in cases
         for i, m in enumerate(modalities)
+    ]
+
+
+def expand_by_label_group(cases: list, groups: list, labels: dict) -> list:
+    """
+    One entry per (case, label group), each carrying the `label_group` index.
+
+    The Encoder II counterpart of expand_by_modality: every group becomes its
+    own single-channel SDF target, so tasks with different numbers of label
+    groups (e.g. liver+tumour vs spleen) share one encoder with
+    out_features=1. The masked-Eikonal loss is already per channel, so this
+    only drops the decoder layers shared between channels. Expand AFTER split
+    lookup so that all groups of a case stay in the same split.
+    """
+    names = ["+".join(labels[i] for i in g) for g in groups]
+    return [
+        {**c, "case_id": f"{c['case_id']}/{n}", "label_group": i, "label_group_name": n}
+        for c in cases
+        for i, n in enumerate(names)
     ]

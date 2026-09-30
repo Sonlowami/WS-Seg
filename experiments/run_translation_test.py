@@ -38,7 +38,7 @@ from scipy.stats import wilcoxon
 from utils.io import load_model_weights
 from utils.metrics import psnr_3d, ssim_3d, per_label_metrics
 from data.dataset import build_dataset
-from data.msd import load_tasks, resolve_shared_label_groups
+from data.msd import load_tasks, resolve_label_groups_per_task
 from sdf.coordinates import get_3d_coordinates
 from sdf.targets import create_multilabel_sdf, sdf_to_channel_masks
 from models.interfaces import build_model
@@ -156,8 +156,9 @@ def main():
         task_cfg["data"]["root"] = args.data_root
     spacing_mm = tuple(task_cfg["data"]["spacing_mm"])
 
-    groups_by_task = resolve_shared_label_groups(task_cfg["sdf"]["label_groups"],
-                                                 load_tasks(task_cfg["data"]))
+    # A fresh model is built per fit, so tasks may have different group counts.
+    groups_by_task = resolve_label_groups_per_task(task_cfg["sdf"]["label_groups"],
+                                                   load_tasks(task_cfg["data"]))
     dataset = build_dataset(task_cfg["data"], split=args.split)
 
     results = []

@@ -19,7 +19,10 @@ from utils.logging_utils import configure_wandb
 from utils.metrics import psnr_3d, ssim_3d, per_label_metrics
 from utils.io import save_encoder_weights
 from data.dataset import build_dataset
-from data.msd import load_tasks, resolve_shared_label_groups
+import warnings
+from data.msd import (
+    load_tasks, resolve_shared_label_groups, resolve_label_groups_per_task,
+)
 from sdf.coordinates import get_3d_coordinates
 from sdf.targets import create_multilabel_sdf, sdf_to_channel_masks
 from models.interfaces import build_model
@@ -34,6 +37,8 @@ def _first(x):
 
 def target_extractor(case, groups_by_task, alpha, spacing_mm, eikonal_lambda):
     label_groups = groups_by_task[_first(case["task"])]         # resolved from dataset.json
+    if "label_group" in case:                                    # per_label: one group per item
+        label_groups = [label_groups[int(case["label_group"])]]
     label_map = case["mask"].squeeze().cpu().numpy()             # (D, H, W)
     sdf_np = create_multilabel_sdf(label_map, label_groups, spacing_mm, alpha)
     target = torch.from_numpy(sdf_np).reshape(-1, sdf_np.shape[-1]).float()
@@ -83,13 +88,26 @@ def main():
     spacing_mm = tuple(cfg["data"]["spacing_mm"])
 
     # Label groups are resolved per task from dataset.json (and validated
-    # against its labels); every task must yield the same channel count.
-    groups_by_task = resolve_shared_label_groups(cfg["sdf"]["label_groups"],
-                                                 load_tasks(cfg["data"]))
-    n_channels = len(next(iter(groups_by_task.values())))
+    # against its labels). The encoder sees only coordinates, so the group
+    # count only sets the decoder width. per_label fits each group as its own
+    # 1-channel SDF, so tasks with different label sets can share one encoder;
+    # otherwise every task must yield the same channel count.
+    per_label = cfg["sdf"].get("per_label", True)
+    tasks = load_tasks(cfg["data"])
+    if per_label:
+        groups_by_task = resolve_label_groups_per_task(cfg["sdf"]["label_groups"], tasks)
+        n_channels = 1
+        if decode_mode == "exclusive":
+            warnings.warn("decode_mode 'exclusive' needs several channels; "
+                          "per_label fits one group at a time, so using 'independent'.")
+            decode_mode = "independent"
+    else:
+        groups_by_task = resolve_shared_label_groups(cfg["sdf"]["label_groups"], tasks)
+        n_channels = len(next(iter(groups_by_task.values())))
     cfg["sdf"]["resolved_label_groups"] = groups_by_task     # saved with the checkpoint
 
-    dataset = build_dataset(cfg["data"], split="train")
+    dataset = build_dataset(cfg["data"], split="train",
+                            label_groups_by_task=groups_by_task if per_label else None)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
 
     model = build_model(cfg["model"], out_features=n_channels)
