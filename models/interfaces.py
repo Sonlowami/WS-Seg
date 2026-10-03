@@ -73,3 +73,33 @@ def build_model(model_cfg: dict, out_features: int) -> EncoderDecoderINR:
         num_decoders=1,     # one decoder at a time; replaced per case
         omegas=[float(model_cfg.get("omega", 30.0))],
     )
+
+
+def print_model_summary(model: EncoderDecoderINR, n_points: int = 4096,
+                        title: str = "STRAINER model") -> dict:
+    """
+    Print a torchinfo layer table (from a forward pass on n_points random
+    coordinates) plus parameter counts split by encoder/decoder and by
+    trainable/frozen, so a frozen encoder is visible at a glance.
+    The model stays on its current device. Returns the counts.
+    """
+    from torchinfo import summary
+
+    def count(params, trainable=None):
+        return sum(p.numel() for p in params
+                   if trainable is None or p.requires_grad == trainable)
+
+    device = next(model.parameters()).device
+    stats = summary(model, input_size=(n_points, 3), device=device, depth=3, verbose=0,
+                    col_names=("input_size", "output_size", "num_params", "trainable"))
+    params = list(model.parameters())
+    counts = {
+        "total": count(params),
+        "encoder": count(model.encoder_parameters()),
+        "decoder": count(model.decoder_parameters()),
+        "trainable": count(params, trainable=True),
+        "frozen": count(params, trainable=False),
+    }
+    print(f"\n{title}\n{stats}")
+    print("Parameters: " + ", ".join(f"{k}={v:,}" for k, v in counts.items()) + "\n")
+    return counts

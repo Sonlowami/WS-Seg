@@ -41,7 +41,7 @@ from data.dataset import build_dataset
 from data.msd import load_tasks, resolve_label_groups_per_task
 from sdf.coordinates import get_3d_coordinates, mm_per_unit
 from sdf.targets import create_multilabel_sdf, sdf_to_channel_masks
-from models.interfaces import build_model
+from models.interfaces import build_model, print_model_summary
 from training.losses import masked_eikonal_sdf_loss
 from training.train_loop import (
     build_optimizer, build_scheduler, resolve_device, sample_points, predict_in_chunks,
@@ -50,7 +50,7 @@ from training.train_loop import (
 
 
 def fit_decoder_and_eval(encoder_state_dict: dict, task_cfg: dict, label_groups: list,
-                         case, coords, spacing_mm, steps: int):
+                         case, coords, spacing_mm, steps: int, summarize: bool = False):
     sdf_cfg = task_cfg["sdf"]
     alpha, eikonal_lambda = sdf_cfg["alpha"], sdf_cfg["eikonal_lambda"]
     decode_mode = sdf_cfg.get("decode_mode", "independent")
@@ -60,6 +60,8 @@ def fit_decoder_and_eval(encoder_state_dict: dict, task_cfg: dict, label_groups:
     model = build_model(task_cfg["model"], out_features=len(label_groups)).to(device)
     model.load_encoder_state_dict(encoder_state_dict, freeze=True)
     model.reset_decoder()
+    if summarize:
+        print_model_summary(model, title=f"STRAINER, frozen encoder (out_features={len(label_groups)})")
 
     label_map = case["mask"].squeeze().cpu().numpy()
     sdf_np = create_multilabel_sdf(label_map, label_groups, spacing_mm, alpha)
@@ -169,8 +171,9 @@ def main():
         coords = get_3d_coordinates(shape, spacing_mm).coords
         label_groups = groups_by_task[case["task"]]
         for steps in args.steps:
+            # Every fit builds the same architecture; summarize only the first.
             r_I = fit_decoder_and_eval(ckpt_I["encoder_state_dict"], task_cfg, label_groups,
-                                       case, coords, spacing_mm, steps)
+                                       case, coords, spacing_mm, steps, summarize=not results)
             r_II = fit_decoder_and_eval(ckpt_II["encoder_state_dict"], task_cfg, label_groups,
                                         case, coords, spacing_mm, steps)
             results.append({

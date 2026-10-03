@@ -25,7 +25,7 @@ from data.msd import (
 )
 from sdf.coordinates import get_3d_coordinates, mm_per_unit
 from sdf.targets import create_multilabel_sdf, sdf_to_channel_masks
-from models.interfaces import build_model
+from models.interfaces import build_model, print_model_summary
 from training.losses import masked_eikonal_sdf_loss
 from training.train_loop import train_encoder_decoder, DEFAULT_POINTS_PER_STEP
 
@@ -112,6 +112,7 @@ def main():
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
 
     model = build_model(cfg["model"], out_features=n_channels)
+    print_model_summary(model, title=f"Encoder II STRAINER (out_features={n_channels})")
     wandb_run = configure_wandb(cfg["wandb"], cfg["experiment_name"], cfg)
 
     def coords_fn(case):

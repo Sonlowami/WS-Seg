@@ -13,7 +13,7 @@ from utils.io import save_encoder_weights
 from data.dataset import build_dataset
 from data.msd import load_tasks, shared_image_channels
 from sdf.coordinates import get_3d_coordinates
-from models.interfaces import build_model
+from models.interfaces import build_model, print_model_summary
 from training.losses import image_reconstruction_loss
 from training.train_loop import train_encoder_decoder, DEFAULT_POINTS_PER_STEP
 
@@ -67,6 +67,7 @@ def main():
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
 
     model = build_model(cfg["model"], out_features=channels)
+    print_model_summary(model, title=f"Encoder I STRAINER (out_features={channels})")
     wandb_run = configure_wandb(cfg["wandb"], cfg["experiment_name"], cfg)
 
     def coords_fn(case):
