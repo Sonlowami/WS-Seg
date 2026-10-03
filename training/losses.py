@@ -16,7 +16,7 @@ def image_reconstruction_loss(pred: torch.Tensor, target: torch.Tensor) -> torch
 
 def masked_eikonal_sdf_loss(pred_sdf: torch.Tensor, coords: torch.Tensor,
                              target_sdf: torch.Tensor, alpha: float,
-                             eikonal_lambda: float) -> dict:
+                             eikonal_lambda: float, mm_per_unit: float = 1.0) -> dict:
     """
     Equation 3, generalized to K SDF channels.
 
@@ -34,6 +34,12 @@ def masked_eikonal_sdf_loss(pred_sdf: torch.Tensor, coords: torch.Tensor,
 
     A channel that is entirely plateau (label absent in this case) has an
     all-zero near-boundary mask and contributes exactly zero Eikonal loss.
+
+    Units: targets are in mm, but coords are normalized to [-1, 1], so
+    autograd gives d(sdf)/d(normalized coord) = mm_per_unit * d(sdf)/d(mm).
+    Pass the grid's mm_per_unit (sdf.coordinates.mm_per_unit) so |grad| = 1
+    is enforced per mm; with the default 1.0 a 1 mm SDF on a ~90 mm volume
+    would be pushed to a ~45x shallower slope than its own target.
 
     Returns total plus the MSE and Eikonal components separately so they can
     be logged independently.
@@ -53,7 +59,7 @@ def masked_eikonal_sdf_loss(pred_sdf: torch.Tensor, coords: torch.Tensor,
             outputs=pred_sdf[:, k].sum(), inputs=coords,
             create_graph=True, retain_graph=True,
         )[0]                                                     # (N, 3)
-        grad_norms.append(grad_k.norm(dim=-1))
+        grad_norms.append(grad_k.norm(dim=-1) / mm_per_unit)
     grad_norm = torch.stack(grad_norms, dim=-1)                  # (N, K)
 
     eikonal_term = ((grad_norm - 1.0) ** 2) * near_boundary

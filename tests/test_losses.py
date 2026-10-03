@@ -60,8 +60,28 @@ def test_absent_label_channel_adds_no_eikonal_loss():
     assert loss_dict["eikonal"].item() < 1e-6
 
 
+def test_eikonal_is_measured_per_mm_on_normalized_coords():
+    """
+    Distance to the plane x_mm = 0 is exactly an SDF in mm. Written in
+    normalized coords (x_mm = M * x), its gradient is M per unit, so the
+    loss is only zero once mm_per_unit=M converts it back to per-mm.
+    """
+    from sdf.coordinates import get_3d_coordinates
+    grid = get_3d_coordinates((40, 30, 20), (1.5, 1.0, 2.0))
+    coords = grid.coords.clone().requires_grad_(True)
+    pred = (grid.mm_per_unit * coords[:, :1])                    # x in mm
+    target = pred.detach()
+    assert abs(grid.mm_per_unit - 30.0) < 1e-6                   # 40 * 1.5 / 2
+    wrong = masked_eikonal_sdf_loss(pred, coords, target, alpha=1e3, eikonal_lambda=1.0)
+    right = masked_eikonal_sdf_loss(pred, coords, target, alpha=1e3, eikonal_lambda=1.0,
+                                    mm_per_unit=grid.mm_per_unit)
+    assert right["eikonal"].item() < 1e-8
+    assert wrong["eikonal"].item() > 100
+
+
 if __name__ == "__main__":
     test_eikonal_masking_excludes_plateau()
     test_eikonal_is_computed_per_channel()
     test_absent_label_channel_adds_no_eikonal_loss()
+    test_eikonal_is_measured_per_mm_on_normalized_coords()
     print("Loss tests passed.")

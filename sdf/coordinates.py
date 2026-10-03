@@ -15,6 +15,17 @@ class CoordinateGrid:
     coords: torch.Tensor        # (N, 3), normalized to [-1, 1]
     shape: tuple                # (D, H, W) original voxel grid shape
     spacing_mm: tuple           # physical spacing used for normalization
+    mm_per_unit: float          # mm per normalized coordinate unit (see below)
+
+
+def mm_per_unit(shape: tuple, spacing_mm: tuple = (1.0, 1.0, 1.0)) -> float:
+    """
+    Scale between normalized coordinates and mm: the half-extent of the
+    longest physical axis, which get_3d_coordinates maps to 1. A gradient
+    taken w.r.t. normalized coordinates is this many times its per-mm value,
+    so the Eikonal loss divides by it (training/losses.py).
+    """
+    return max(n * s for n, s in zip(shape, spacing_mm)) / 2
 
 
 def get_3d_coordinates(shape: tuple, spacing_mm: tuple = (1.0, 1.0, 1.0),
@@ -41,7 +52,7 @@ def get_3d_coordinates(shape: tuple, spacing_mm: tuple = (1.0, 1.0, 1.0),
 
     # Re-normalize to [-1, 1] after physical scaling, since the encoder
     # expects a bounded input domain regardless of the volume's physical size.
-    max_extent = coords.abs().max()
-    coords = coords / max_extent
+    scale = mm_per_unit(shape, spacing_mm)
+    coords = coords / scale
 
-    return CoordinateGrid(coords=coords, shape=shape, spacing_mm=spacing_mm)
+    return CoordinateGrid(coords=coords, shape=shape, spacing_mm=spacing_mm, mm_per_unit=scale)

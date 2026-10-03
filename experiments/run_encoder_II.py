@@ -23,7 +23,7 @@ import warnings
 from data.msd import (
     load_tasks, resolve_shared_label_groups, resolve_label_groups_per_task,
 )
-from sdf.coordinates import get_3d_coordinates
+from sdf.coordinates import get_3d_coordinates, mm_per_unit
 from sdf.targets import create_multilabel_sdf, sdf_to_channel_masks
 from models.interfaces import build_model
 from training.losses import masked_eikonal_sdf_loss
@@ -44,7 +44,8 @@ def target_extractor(case, groups_by_task, alpha, spacing_mm, eikonal_lambda):
     target = torch.from_numpy(sdf_np).reshape(-1, sdf_np.shape[-1]).float()
     return target, {
         "needs_coord_grad": True,   # Eikonal term requires d(pred)/d(coords)
-        "loss_kwargs": {"alpha": alpha, "eikonal_lambda": eikonal_lambda},
+        "loss_kwargs": {"alpha": alpha, "eikonal_lambda": eikonal_lambda,
+                        "mm_per_unit": mm_per_unit(label_map.shape, spacing_mm)},
     }
 
 

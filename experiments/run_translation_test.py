@@ -39,7 +39,7 @@ from utils.io import load_model_weights
 from utils.metrics import psnr_3d, ssim_3d, per_label_metrics
 from data.dataset import build_dataset
 from data.msd import load_tasks, resolve_label_groups_per_task
-from sdf.coordinates import get_3d_coordinates
+from sdf.coordinates import get_3d_coordinates, mm_per_unit
 from sdf.targets import create_multilabel_sdf, sdf_to_channel_masks
 from models.interfaces import build_model
 from training.losses import masked_eikonal_sdf_loss
@@ -64,6 +64,7 @@ def fit_decoder_and_eval(encoder_state_dict: dict, task_cfg: dict, label_groups:
     label_map = case["mask"].squeeze().cpu().numpy()
     sdf_np = create_multilabel_sdf(label_map, label_groups, spacing_mm, alpha)
     target = torch.from_numpy(sdf_np).reshape(-1, sdf_np.shape[-1]).float().to(device)
+    scale = mm_per_unit(label_map.shape, spacing_mm)
     coords = coords.to(device)
 
     optimizer = build_optimizer(model.decoder_parameters(), task_cfg["optimizer"])
@@ -74,7 +75,8 @@ def fit_decoder_and_eval(encoder_state_dict: dict, task_cfg: dict, label_groups:
         coords_batch, target_batch = sample_points(
             coords, target, train_cfg.get("points_per_step", DEFAULT_POINTS_PER_STEP), requires_grad=True)
         pred = model.forward(coords_batch)
-        loss_dict = masked_eikonal_sdf_loss(pred, coords_batch, target_batch, alpha, eikonal_lambda)
+        loss_dict = masked_eikonal_sdf_loss(pred, coords_batch, target_batch, alpha, eikonal_lambda,
+                                            mm_per_unit=scale)
         loss_dict["total"].backward()
         optimizer.step()
         scheduler.step()
