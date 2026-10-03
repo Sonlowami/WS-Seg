@@ -19,7 +19,10 @@ class EncoderDecoderINR(Protocol):
     returns: (N, out_features) tensor -- intensity (out_features=1) or SDF (out_features=1)
     """
 
-    def forward(self, coords: torch.Tensor) -> torch.Tensor: ...
+    def forward(self, coords: torch.Tensor, decoder_index: int = 0) -> torch.Tensor:
+        """Shared encoder, then decoder head `decoder_index` (joint training
+        keeps one head per training case; everything else uses head 0)."""
+        ...
 
     def encoder_parameters(self) -> "list[torch.nn.Parameter]": ...
 
@@ -40,7 +43,7 @@ class EncoderDecoderINR(Protocol):
     def load_encoder_state_dict(self, state_dict: dict, freeze: bool = False) -> None: ...
 
 
-def build_model(model_cfg: dict, out_features: int) -> EncoderDecoderINR:
+def build_model(model_cfg: dict, out_features: int, num_decoders: int = 1) -> EncoderDecoderINR:
     """
     Build an EncoderDecoderINR from the `model:` block of the training config.
     This is the one place a concrete architecture is wired in; it wraps
@@ -53,6 +56,8 @@ def build_model(model_cfg: dict, out_features: int) -> EncoderDecoderINR:
         omega           optional SIREN frequency, default 30.0
     Inputs are always 3-D coordinates; out_features is the target width
     (image channels for Encoder I, label groups for Encoder II).
+    num_decoders: one head per training case for STRAINER-style joint
+    training (training/train_loop.py: train_encoder_jointly); 1 otherwise.
     """
     # Imported here: strainer_inr imports this module for the Protocol.
     from models.strainer_inr import STRAINER_INR
@@ -70,7 +75,7 @@ def build_model(model_cfg: dict, out_features: int) -> EncoderDecoderINR:
         hidden_layers=encoder_layers + decoder_layers,
         out_features=out_features,
         num_shared_layers=encoder_layers,
-        num_decoders=1,     # one decoder at a time; replaced per case
+        num_decoders=num_decoders,
         omegas=[float(model_cfg.get("omega", 30.0))],
     )
 

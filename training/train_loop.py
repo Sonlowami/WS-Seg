@@ -11,12 +11,20 @@ only the loss_fn and target extraction differ, injected by the caller
 (experiments/run_encoder_I.py, experiments/run_encoder_II.py). This mirrors
 Phase I of the architecture: the encoder is kept across images, the decoder
 is replaced for each new image (see models/interfaces.py: reset_decoder).
+
+Two ways to learn the shared encoder (training.mode):
+  joint       train_encoder_jointly -- STRAINER: one decoder head per training
+              item, all trained together, each step mixing several cases, so
+              the encoder learns what is shared across the whole set.
+  sequential  train_encoder_decoder -- one case at a time with a fresh decoder;
+              the encoder drifts towards whichever cases came last.
 """
 from typing import Callable
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
 
 from models.interfaces import EncoderDecoderINR
+from sdf.coordinates import coords_from_indices
 from utils.logging_utils import log as wandb_log
 
 # Used when a config has no training.points_per_step. Never default to the
@@ -144,4 +152,116 @@ def train_encoder_decoder(
             global_step += 1
 
         del coords, target_dev
+    return model.encoder_state_dict()
+
+
+# ---------------------------------------------------------------- joint (STRAINER) training
+
+def _first(x):
+    """DataLoader (batch_size=1) wraps string fields in a list."""
+    return x[0] if isinstance(x, (list, tuple)) else x
+
+
+def prepare_items(dataloader, target_extractor: Callable, shape_fn: Callable,
+                  storage_dtype=torch.float16) -> list:
+    """
+    Load every training item once: {case_id, shape, target (N, C) on CPU,
+    extra}. Joint training needs every item's target at every step, so they
+    are kept in CPU memory (float16 by default: ample for z-scored
+    intensities and for SDFs clipped to +-alpha); coordinates are never
+    stored, they are rebuilt from sampled indices (coords_from_indices).
+    """
+    items = []
+    for case in dataloader:
+        target, extra = target_extractor(case)
+        if hasattr(target, "as_tensor"):                 # MONAI MetaTensor
+            target = target.as_tensor()
+        items.append({"case_id": _first(case["case_id"]), "shape": tuple(shape_fn(case)),
+                      "target": target.to(storage_dtype).contiguous(), "extra": extra})
+    total = sum(i["target"].numel() * i["target"].element_size() for i in items)
+    print(f"prepared {len(items)} training items; targets use {total / 1e9:.2f} GB of CPU memory")
+    return items
+
+
+@torch.no_grad()
+def predict_volume(model, shape: tuple, spacing_mm: tuple, decoder_index: int = 0,
+                   chunk_size: int = 2 ** 20, device="cpu") -> torch.Tensor:
+    """Full-volume prediction of one head, chunked over voxel indices so no
+    full coordinate grid is ever built. Returned on CPU as (N, C)."""
+    n = shape[0] * shape[1] * shape[2]
+    out = []
+    for start in range(0, n, chunk_size):
+        idx = torch.arange(start, min(start + chunk_size, n), device=device)
+        out.append(model.forward(coords_from_indices(idx, shape, spacing_mm), decoder_index).cpu())
+    return torch.cat(out)
+
+
+def train_encoder_jointly(
+    items: list,                      # from prepare_items
+    model: EncoderDecoderINR,         # built with num_decoders=len(items)
+    loss_fn: Callable,                # (pred, coords, target, **extra) -> dict with "total"
+    metric_fn: Callable,              # (pred, target, shape) -> dict of scalar metrics to log
+    optimizer_cfg: dict,
+    scheduler_cfg: dict,
+    steps: int,                       # total optimizer steps
+    log_every_n_steps: int,
+    wandb_run,
+    spacing_mm: tuple,
+    cases_per_step: int = 8,
+    points_per_step: int = DEFAULT_POINTS_PER_STEP,  # split evenly across the step's cases
+    eval_chunk_size: int = 2 ** 20,
+    device=None,
+):
+    """
+    STRAINER-style joint training: one shared encoder, decoder head i fits
+    item i, and every step mixes cases_per_step random items, so each update
+    of the encoder is pulled by several different cases at once. Losses are
+    averaged over the step's items. Heads not drawn in a step get no
+    gradient (grads are None, so Adam leaves them untouched). Metrics are
+    computed on the full volume of one drawn item per log step. Returns the
+    encoder's state_dict; the heads are dropped, as in sequential training.
+    """
+    n_heads = len(getattr(model, "decoder", []))
+    if n_heads and n_heads != len(items):
+        raise ValueError(f"Model has {n_heads} decoder heads but there are {len(items)} items; "
+                         f"build it with num_decoders=len(items).")
+    device = resolve_device(device)
+    model.to(device)
+    per_step = min(cases_per_step, len(items))
+    per_case = max(points_per_step // per_step, 1)
+    print(f"train_encoder_jointly: device={device}, {len(items)} heads, {steps} steps, "
+          f"{per_step} items x {per_case} points per step "
+          f"(~{steps * per_step / len(items):.0f} steps per head), eval_chunk_size={eval_chunk_size}")
+
+    optimizer = build_optimizer(model.parameters(), optimizer_cfg)
+    scheduler = build_scheduler(optimizer, scheduler_cfg, steps)
+
+    for step in range(steps):
+        optimizer.zero_grad(set_to_none=True)
+        chosen = torch.randperm(len(items))[:per_step].tolist()
+        losses = []
+        for i in chosen:
+            item = items[i]
+            idx = torch.randint(item["target"].shape[0], (per_case,))
+            target = item["target"][idx].to(device, dtype=torch.float32, non_blocking=True)
+            coords = coords_from_indices(idx.to(device), item["shape"], spacing_mm)
+            coords.requires_grad_(item["extra"].get("needs_coord_grad", False))
+            pred = model.forward(coords, decoder_index=i)
+            losses.append(loss_fn(pred, coords, target, **item["extra"].get("loss_kwargs", {})))
+        total = torch.stack([l["total"] for l in losses]).mean()
+        total.backward()
+        optimizer.step()
+        scheduler.step()
+
+        if step % log_every_n_steps == 0 or step == steps - 1:
+            i = chosen[0]
+            item = items[i]
+            full = predict_volume(model, item["shape"], spacing_mm, i, eval_chunk_size, device)
+            metrics = metric_fn(full, item["target"].float(), item["shape"])
+            for key in losses[0]:
+                if key != "total":
+                    metrics[f"loss/{key}"] = torch.stack([l[key] for l in losses]).mean()
+            metrics["loss/total"] = total.detach()
+            wandb_log(wandb_run, metrics, step=step)
+
     return model.encoder_state_dict()

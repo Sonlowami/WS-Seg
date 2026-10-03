@@ -27,7 +27,9 @@ from sdf.coordinates import get_3d_coordinates, mm_per_unit
 from sdf.targets import create_multilabel_sdf, sdf_to_channel_masks
 from models.interfaces import build_model, print_model_summary
 from training.losses import masked_eikonal_sdf_loss
-from training.train_loop import train_encoder_decoder, DEFAULT_POINTS_PER_STEP
+from training.train_loop import (
+    train_encoder_decoder, train_encoder_jointly, prepare_items, DEFAULT_POINTS_PER_STEP,
+)
 
 
 def _first(x):
@@ -109,15 +111,6 @@ def main():
 
     dataset = build_dataset(cfg["data"], split="train",
                             label_groups_by_task=groups_by_task if per_label else None)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
-
-    model = build_model(cfg["model"], out_features=n_channels)
-    print_model_summary(model, title=f"Encoder II STRAINER (out_features={n_channels})")
-    wandb_run = configure_wandb(cfg["wandb"], cfg["experiment_name"], cfg)
-
-    def coords_fn(case):
-        shape = tuple(case["mask"].shape[-3:])
-        return get_3d_coordinates(shape, spacing_mm).coords, shape
 
     def bound_target_extractor(case):
         return target_extractor(case, groups_by_task, alpha, spacing_mm, eikonal_lambda)
@@ -125,22 +118,46 @@ def main():
     def bound_metric_fn(pred, target, shape):
         return metric_fn(pred, target, shape, spacing_mm, decode_mode)
 
-    encoder_state_dict = train_encoder_decoder(
-        dataloader=dataloader,
-        model=model,
-        coords_fn=coords_fn,
-        target_extractor=bound_target_extractor,
-        loss_fn=masked_eikonal_sdf_loss,
-        metric_fn=bound_metric_fn,
-        optimizer_cfg=cfg["optimizer"],
-        scheduler_cfg=cfg["scheduler"],
-        epoch_count=cfg["training"]["epochs"],
-        log_every_n_epochs=cfg["training"]["log_every_n_epochs"],
-        wandb_run=wandb_run,
-        points_per_step=cfg["training"].get("points_per_step", DEFAULT_POINTS_PER_STEP),
-        eval_chunk_size=cfg["training"].get("eval_chunk_size", 2 ** 20),
-        device=cfg["training"].get("device", "auto"),
+    train_cfg = cfg["training"]
+    mode = train_cfg.get("mode", "joint")
+    common = dict(
+        loss_fn=masked_eikonal_sdf_loss, metric_fn=bound_metric_fn,
+        optimizer_cfg=cfg["optimizer"], scheduler_cfg=cfg["scheduler"],
+        points_per_step=train_cfg.get("points_per_step", DEFAULT_POINTS_PER_STEP),
+        eval_chunk_size=train_cfg.get("eval_chunk_size", 2 ** 20),
+        device=train_cfg.get("device", "auto"),
     )
+
+    if mode == "joint":
+        # STRAINER: one decoder head per training item, all trained together.
+        if "steps" not in train_cfg:
+            raise SystemExit("training.steps (total optimizer steps) is required for mode: joint")
+        items = prepare_items(DataLoader(dataset, batch_size=1, shuffle=False),
+                              bound_target_extractor, shape_fn=lambda case: case["mask"].shape[-3:])
+        model = build_model(cfg["model"], out_features=n_channels, num_decoders=len(items))
+        print_model_summary(model, title=f"Encoder II STRAINER, {len(items)} heads "
+                                         f"(out_features={n_channels})")
+        wandb_run = configure_wandb(cfg["wandb"], cfg["experiment_name"], cfg)
+        encoder_state_dict = train_encoder_jointly(
+            items=items, model=model, steps=train_cfg["steps"],
+            log_every_n_steps=train_cfg["log_every_n_epochs"], wandb_run=wandb_run,
+            spacing_mm=spacing_mm, cases_per_step=train_cfg.get("cases_per_step", 8), **common)
+    elif mode == "sequential":
+        model = build_model(cfg["model"], out_features=n_channels)
+        print_model_summary(model, title=f"Encoder II STRAINER (out_features={n_channels})")
+        wandb_run = configure_wandb(cfg["wandb"], cfg["experiment_name"], cfg)
+
+        def coords_fn(case):
+            shape = tuple(case["mask"].shape[-3:])
+            return get_3d_coordinates(shape, spacing_mm).coords, shape
+
+        encoder_state_dict = train_encoder_decoder(
+            dataloader=DataLoader(dataset, batch_size=1, shuffle=True),
+            model=model, coords_fn=coords_fn, target_extractor=bound_target_extractor,
+            epoch_count=train_cfg["epochs"], log_every_n_epochs=train_cfg["log_every_n_epochs"],
+            wandb_run=wandb_run, **common)
+    else:
+        raise SystemExit(f"Unknown training.mode {mode!r}; use 'joint' or 'sequential'.")
 
     save_encoder_weights(encoder_state_dict, cfg, out_dir=f"checkpoints/{cfg['experiment_name']}")
 

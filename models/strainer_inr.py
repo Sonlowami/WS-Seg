@@ -4,8 +4,16 @@ from .interfaces import EncoderDecoderINR
 from alpine.models.strainer import Strainer, get_linear_layer
 
 class STRAINER_INR(Strainer, EncoderDecoderINR):
-    def forward(self, coords):
-        return super().forward(coords)["output"].squeeze(1)
+    def forward(self, coords, decoder_index: int = 0):
+        """Shared encoder, then one decoder head. Alpine's own forward runs
+        every head on every point, which jointly training N heads on N
+        different cases (each with its own coordinates) does not want."""
+        out = coords
+        for layer in self.encoder:
+            out = layer(out)
+        for layer in self.decoder[decoder_index]:
+            out = layer(out)
+        return out
 
     def encoder_parameters(self) -> list:
         return list(self.encoder.parameters())

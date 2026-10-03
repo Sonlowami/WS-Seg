@@ -56,3 +56,24 @@ def get_3d_coordinates(shape: tuple, spacing_mm: tuple = (1.0, 1.0, 1.0),
     coords = coords / scale
 
     return CoordinateGrid(coords=coords, shape=shape, spacing_mm=spacing_mm, mm_per_unit=scale)
+
+
+def coords_from_indices(flat_idx: torch.Tensor, shape: tuple,
+                        spacing_mm: tuple = (1.0, 1.0, 1.0)) -> torch.Tensor:
+    """
+    The rows of get_3d_coordinates(shape, spacing_mm).coords at flat_idx,
+    computed directly, so joint training never stores an (N, 3) grid per
+    case (~1 GB for a 1 mm CT). Uses the same float32 ops as
+    get_3d_coordinates (linspace, physical scale, divide by mm_per_unit),
+    so the results match it exactly.
+    """
+    d, h, w = shape
+    sd, sh, sw = spacing_mm
+    scale = mm_per_unit(shape, spacing_mm)
+    i, rem = flat_idx // (h * w), flat_idx % (h * w)
+    j, k = rem // w, rem % w
+    axes = []
+    for n, s_mm, ix in ((d, sd, i), (h, sh, j), (w, sw, k)):
+        line = torch.linspace(-1, 1, n, device=flat_idx.device) * (n * s_mm) / 2
+        axes.append(line[ix])
+    return torch.stack(axes, dim=-1) / scale
