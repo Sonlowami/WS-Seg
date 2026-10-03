@@ -74,11 +74,17 @@ def resolve_config(args) -> tuple:
         encoder_state_dict = ckpt["encoder_state_dict"]
     cfg = load_config(args.config) if args.config else ckpt["config"]
     if args.encoder_ckpt and args.config:
-        # Encoder weights only fit the architecture they were trained with.
-        if cfg["model"] != ckpt["config"]["model"]:
-            warnings.warn("--config model block differs from the checkpoint's; "
-                          "using the checkpoint's architecture.")
-        cfg["model"] = ckpt["config"]["model"]
+        # Encoder weights only fit the encoder they were trained with, but the
+        # decoder is always freshly initialized, so its depth may come from
+        # --config (e.g. a non-linear decoder on a frozen prior).
+        ckpt_model, cfg_model = ckpt["config"]["model"], cfg["model"]
+        encoder_keys = [k for k in ckpt_model if k != "decoder_layers"]
+        differing = [k for k in encoder_keys if cfg_model.get(k, ckpt_model[k]) != ckpt_model[k]]
+        if differing:
+            warnings.warn(f"--config model keys {differing} differ from the checkpoint's; "
+                          f"using the checkpoint's values (they define the encoder).")
+        cfg["model"] = {**ckpt_model,
+                        "decoder_layers": cfg_model.get("decoder_layers", ckpt_model["decoder_layers"])}
     if "sdf" not in cfg:
         raise SystemExit("Config has no sdf: block (alpha, eikonal_lambda, label_groups); "
                          "pass --config with one.")
