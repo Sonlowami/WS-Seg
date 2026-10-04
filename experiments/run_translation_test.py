@@ -1,201 +1,319 @@
 """
-Translation test: does Encoder I (image-pretrained) or Encoder II
-(SDF-pretrained) provide a better prior for fitting an unseen case's
-multi-channel mask SDF?
+Translation test: is an image-pretrained (Encoder I) or SDF-pretrained
+(Encoder II) STRAINER encoder a better prior for fitting an unseen case's
+mask SDF -- and is either better than no prior at all?
 
-For each held-out case and each step budget in {50, 100, 200}:
-  - fit a fresh decoder against the frozen Encoder I
-  - fit a fresh decoder against the frozen Encoder II
-  - record PSNR, SSIM, and per-label + mean Dice / NSD for both
+Arms, fitted to every case with identical settings:
+  enc_I    encoder initialized from the Encoder I checkpoint
+  enc_II   encoder initialized from the Encoder II checkpoint
+  random   randomly initialized encoder (the no-prior baseline)
+Protocol: the encoder is frozen and only a fresh decoder is fitted (default,
+as in visualize_sdf_fit), or with --train_encoder the whole network is fitted
+from the prior (STRAINER's test-time protocol). The random arm follows the
+same protocol, so "frozen" compares fixed random features with fixed priors.
 
-Fairness: the task (alpha, eikonal_lambda, label_groups, decode_mode) and the
-decoder-fitting optimizer/scheduler are taken from ONE config -- Encoder II's
--- and applied to both encoders. Reading each checkpoint's own settings would
-let a mismatch in alpha or optimizer silently masquerade as an encoder
-difference. The two checkpoints must, however, share a model architecture,
-since only the encoder weights are transferred.
+Fit length: every case/arm is fitted once for max(--steps) and scored at each
+budget in --steps (an "anytime" curve; the lr schedule spans the longest
+budget). --separate_fits instead fits each budget separately with its own
+full schedule. The summary reports whether the curves have flattened at the
+last budget, which is what backs a claim at "adequate" fitting length.
 
-Dice/NSD are computed alongside PSNR/SSIM because the Experiment 1
-methodology names Dice as the success criterion; PSNR/SSIM alone don't say
-whether boundaries come out right after thresholding.
+Cases: the held-out --split of the tasks the encoders were trained on
+("internal"), and/or every case of tasks they never saw (--external_root /
+--external_tasks, "external"), which tests whether the prior generalizes.
+--shard i/n partitions the case list across jobs; --merge combines the
+shards' per-label CSVs into one summary.
 
-Paired per-case results feed a Wilcoxon signed-rank test (chosen over a
-paired t-test since sample counts are small and Dice/PSNR are unlikely to be
-reliably normal at that scale).
+Fairness: task and fit settings (alpha, eikonal_lambda, label_groups,
+decode_mode, optimizer, scheduler, points) come from ONE config -- Encoder
+II's checkpoint, or --config -- and apply to every arm. Each case uses one
+seed for all arms, so decoder initialization and point batches are identical
+and arms differ only by encoder. Fitting and scoring are the same code as
+visualize_sdf_fit (training/sdf_fit.py).
+
+Dice: per label group, on the resampled grid ("dice", what the INR fits) and
+on the original label file's grid ("native_dice", against the original
+annotation; the headline number). Labels absent from a case's ground truth
+are NaN and excluded. Paired Wilcoxon signed-rank tests over cases compare
+enc_II - enc_I, enc_I - random and enc_II - random at every budget, with Holm
+correction within each (case group, metric).
 
 Usage:
   python -m experiments.run_translation_test \\
       --encoder_I_ckpt checkpoints/encoder_I_intensity \\
       --encoder_II_ckpt checkpoints/encoder_II_sdf \\
-      --data_root /path/to/Decathlon --split test --steps 50 100 200
+      --split test --steps 250 500 1000 2000 4000 \\
+      --external_root /data/Decathlon --external_tasks Task09_Spleen \\
+      --shard 0/4 --out results/tt_shard0
+  python -m experiments.run_translation_test --merge results/tt_shard*_per_label.csv \\
+      --out results/tt_all
 """
 import argparse
+import copy
 import csv
+import json
 import math
-import torch
-from scipy.stats import wilcoxon
+from pathlib import Path
 
+from utils.config import load_config
 from utils.io import load_model_weights
-from utils.metrics import psnr_3d, ssim_3d, per_label_metrics
+from utils.stats import ARMS, shard, summarize
 from data.dataset import build_dataset
 from data.msd import load_tasks, resolve_label_groups_per_task
-from sdf.coordinates import get_3d_coordinates, mm_per_unit
-from sdf.targets import create_multilabel_sdf, sdf_to_channel_masks
-from models.interfaces import build_model, print_model_summary
-from training.losses import masked_eikonal_sdf_loss
-from training.train_loop import (
-    build_optimizer, build_scheduler, resolve_device, sample_points, predict_in_chunks,
-    DEFAULT_POINTS_PER_STEP,
-)
+from training.train_loop import resolve_device
+from training.sdf_fit import prepare_sdf_case, fit_sdf, evaluate_sdf_fit, group_names, case_seed
+
+FIELDS = ["group", "task", "case_id", "arm", "protocol", "schedule", "steps", "fit_seconds",
+          "psnr", "label", "gt_voxels", "dice", "nsd", "oracle_dice", "native_dice", "native_nsd"]
 
 
-def fit_decoder_and_eval(encoder_state_dict: dict, task_cfg: dict, label_groups: list,
-                         case, coords, spacing_mm, steps: int, summarize: bool = False):
-    sdf_cfg = task_cfg["sdf"]
-    alpha, eikonal_lambda = sdf_cfg["alpha"], sdf_cfg["eikonal_lambda"]
-    decode_mode = sdf_cfg.get("decode_mode", "independent")
+# ---------------------------------------------------------------- config
 
-    train_cfg = task_cfg["training"]
-    device = resolve_device(train_cfg.get("device", "auto"))
-    model = build_model(task_cfg["model"], out_features=len(label_groups)).to(device)
-    model.load_encoder_state_dict(encoder_state_dict, freeze=True)
-    model.reset_decoder()
-    if summarize:
-        print_model_summary(model, title=f"STRAINER, frozen encoder (out_features={len(label_groups)})")
-
-    label_map = case["mask"].squeeze().cpu().numpy()
-    sdf_np = create_multilabel_sdf(label_map, label_groups, spacing_mm, alpha)
-    target = torch.from_numpy(sdf_np).reshape(-1, sdf_np.shape[-1]).float().to(device)
-    scale = mm_per_unit(label_map.shape, spacing_mm)
-    coords = coords.to(device)
-
-    optimizer = build_optimizer(model.decoder_parameters(), task_cfg["optimizer"])
-    scheduler = build_scheduler(optimizer, task_cfg["scheduler"], steps)
-
-    for _ in range(steps):
-        optimizer.zero_grad()
-        coords_batch, target_batch = sample_points(
-            coords, target, train_cfg.get("points_per_step", DEFAULT_POINTS_PER_STEP), requires_grad=True)
-        pred = model.forward(coords_batch)
-        loss_dict = masked_eikonal_sdf_loss(pred, coords_batch, target_batch, alpha, eikonal_lambda,
-                                            mm_per_unit=scale)
-        loss_dict["total"].backward()
-        optimizer.step()
-        scheduler.step()
-
-    pred_final = predict_in_chunks(model, coords, train_cfg.get("eval_chunk_size", 2 ** 20))
-
-    shape = tuple(case["mask"].shape[-3:])
-    k = len(label_groups)
-    pred_sdf = pred_final.reshape(*shape, k).cpu().numpy()
-    data_range = 2 * abs(sdf_np).max()
-
-    pred_masks = sdf_to_channel_masks(pred_sdf, mode=decode_mode)
-    gt_masks = sdf_np < 0.0
-
-    metrics = {
-        "psnr": psnr_3d(pred_sdf, sdf_np, data_range=data_range),
-        "ssim": ssim_3d(pred_sdf, sdf_np, data_range=data_range, channel_axis=-1),
-    }
-    metrics.update(per_label_metrics(pred_masks, gt_masks, spacing_mm))
-    return metrics
+def _encoder_keys(model_cfg: dict) -> dict:
+    return {k: v for k, v in model_cfg.items() if k != "decoder_layers"}
 
 
-def run_significance_tests(results: list, steps: list):
-    """Paired Wilcoxon signed-rank test per step budget, on mean Dice and PSNR."""
-    summary = []
-    for steps_n in steps:
-        for metric in ("mean_dice", "psnr"):
-            pairs = [
-                (r[f"enc_I_{metric}"], r[f"enc_II_{metric}"])
-                for r in results if r["steps"] == steps_n
-                and not math.isnan(r[f"enc_I_{metric}"])
-                and not math.isnan(r[f"enc_II_{metric}"])
-            ]
-            if len(pairs) < 2:
-                continue  # Wilcoxon needs at least a couple of paired samples
-            enc_I, enc_II = zip(*pairs)
-            stat, p_value = wilcoxon(enc_I, enc_II)
-            summary.append({
-                "steps": steps_n, "metric": metric, "n_pairs": len(pairs),
-                "median_enc_I": sorted(enc_I)[len(enc_I) // 2],
-                "median_enc_II": sorted(enc_II)[len(enc_II) // 2],
-                "wilcoxon_stat": stat, "p_value": p_value,
-            })
-    return summary
+def resolve_fit_config(ckpt_I: dict, ckpt_II: dict, config_path: str, data_root: str) -> dict:
+    cfg_I, cfg_II = ckpt_I["config"], ckpt_II["config"]
+    if _encoder_keys(cfg_I["model"]) != _encoder_keys(cfg_II["model"]):
+        raise SystemExit(f"Encoders have different architectures ({cfg_I['model']} vs "
+                         f"{cfg_II['model']}); their weights are not comparable.")
+    if cfg_I["data"]["spacing_mm"] != cfg_II["data"]["spacing_mm"]:
+        raise SystemExit("Encoders were trained at different voxel spacings.")
+    # Same tasks and split, or a "held-out" case for one may be a training case for the other.
+    for key in ("tasks", "split"):
+        if cfg_I["data"][key] != cfg_II["data"][key]:
+            raise SystemExit(f"Encoders were trained with different data.{key}: "
+                             f"{cfg_I['data'][key]} vs {cfg_II['data'][key]}")
 
+    cfg = copy.deepcopy(cfg_II)
+    if config_path:
+        override = load_config(config_path)
+        for block in ("sdf", "optimizer", "scheduler", "training"):
+            if block in override:
+                cfg[block] = override[block]
+        # The decoder is always fresh, so its depth may differ from training.
+        if "decoder_layers" in override.get("model", {}):
+            cfg["model"]["decoder_layers"] = override["model"]["decoder_layers"]
+    if data_root:
+        cfg["data"]["root"] = data_root
+    return cfg
+
+
+# ---------------------------------------------------------------- cases
+
+def collect_cases(cfg: dict, args, trained_tasks: set) -> list:
+    """[(group, dataset, index, case_id, groups_by_task, labels_by_task)],
+    sorted, capped per group by --max_cases, then sharded."""
+    sources = []
+    if not args.skip_internal:
+        tasks = load_tasks(cfg["data"])
+        sources.append(("internal", build_dataset(cfg["data"], split=args.split),
+                        resolve_label_groups_per_task(cfg["sdf"]["label_groups"], tasks),
+                        {t.name: t.labels for t in tasks}))
+    if args.external_tasks:
+        overlap = set(args.external_tasks) & trained_tasks
+        if overlap:
+            raise SystemExit(f"External tasks {sorted(overlap)} were used to train the encoders; "
+                             f"they cannot test generalization.")
+        ext_cfg = {"root": args.external_root, "tasks": args.external_tasks,
+                   "spacing_mm": cfg["data"]["spacing_mm"]}
+        spec = "auto" if args.external_label_groups == "auto" else json.loads(args.external_label_groups)
+        tasks = load_tasks(ext_cfg)
+        sources.append(("external", build_dataset(ext_cfg, split="all"),
+                        resolve_label_groups_per_task(spec, tasks), {t.name: t.labels for t in tasks}))
+    if not sources:
+        raise SystemExit("Nothing to evaluate: --skip_internal without --external_tasks.")
+
+    refs = []
+    for group, dataset, groups, labels in sources:
+        ids = sorted((e["case_id"], i) for i, e in enumerate(dataset.data))
+        if args.max_cases:
+            ids = ids[:args.max_cases]
+        refs += [(group, dataset, i, case_id, groups, labels) for case_id, i in ids]
+    return shard(refs, args.shard, key=lambda r: (r[0], r[3]))
+
+
+# ---------------------------------------------------------------- csv
+
+def read_rows(paths: list) -> list:
+    rows = []
+    for path in paths:
+        with open(path, newline="") as f:
+            rows += list(csv.DictReader(f))
+    return rows
+
+
+class RowWriter:
+    """Appends per-label rows and flushes after each fit, so an interrupted
+    run keeps everything finished so far (see --resume)."""
+
+    def __init__(self, path: Path, resume: bool):
+        if path.exists() and not resume:
+            raise SystemExit(f"{path} exists; pass --resume to continue it or choose another --out.")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        new = not path.exists()
+        self.f = open(path, "a", newline="")
+        self.writer = csv.DictWriter(self.f, fieldnames=FIELDS)
+        if new:
+            self.writer.writeheader()
+
+    def write(self, rows: list):
+        self.writer.writerows(rows)
+        self.f.flush()
+
+
+def write_csv(path: Path, rows: list):
+    if not rows:
+        return
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# ---------------------------------------------------------------- summary
+
+def report(rows: list, out: str, tol: float):
+    has_native = any(not math.isnan(float(r["native_dice"])) for r in rows)
+    metrics = ("native_dice", "dice") if has_native else ("dice",)
+    headline = metrics[0]
+    s = summarize(rows, metrics=metrics, tol=tol)
+    for name in ("table", "tests", "convergence"):
+        write_csv(Path(f"{out}_{name}.csv"), s[name])
+
+    print(f"\n==== {headline} (median of per-case means over label groups) ====")
+    for group in sorted({r["group"] for r in s["table"]}):
+        print(f"[{group}]")
+        arms = [a for a in ARMS if any(r["arm"] == a and r["group"] == group for r in s["table"])]
+        print("  steps  " + "".join(f"{a:>16}" for a in arms))
+        for steps in sorted({r["steps"] for r in s["table"] if r["group"] == group}):
+            cells = {r["arm"]: r for r in s["table"]
+                     if r["group"] == group and r["steps"] == steps}
+            print(f"  {steps:>5}  " + "".join(
+                f"{cells[a][f'median_{headline}']:>10.4f} (n={cells[a][f'n_{headline}']:<2})"
+                for a in arms))
+        print("  paired Wilcoxon (median difference, Holm-adjusted p):")
+        for t in s["tests"]:
+            if t["group"] == group and t["metric"] == headline:
+                print(f"    steps={t['steps']:>5} {t['pair']:<17} n={t['n']:<3} "
+                      f"diff={t['median_diff']:+.4f} p={t['p']:.4g} p_holm={t['p_holm']:.4g}")
+        print("  convergence (median change over the last two budgets):")
+        for c in s["convergence"]:
+            if c["group"] == group and c["metric"] == headline:
+                flag = "converged" if c["converged"] else "STILL CHANGING"
+                print(f"    {c['arm']:<7} {c['steps_prev']}->{c['steps_last']}: "
+                      f"{c['median_prev']:.4f} -> {c['median_last']:.4f} "
+                      f"({c['change']:+.4f}, {flag} at tol {tol})")
+    print(f"\nSummary CSVs: {out}_table.csv, {out}_tests.csv, {out}_convergence.csv")
+
+
+# ---------------------------------------------------------------- main
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--encoder_I_ckpt", required=True)
-    parser.add_argument("--encoder_II_ckpt", required=True)
-    parser.add_argument("--data_root", default=None,
-                        help="Override data.root (paths differ between machines)")
-    parser.add_argument("--split", default="test")
-    parser.add_argument("--steps", nargs="+", type=int, default=[50, 100, 200])
-    parser.add_argument("--out_csv", default="translation_test_results.csv")
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--encoder_I_ckpt")
+    parser.add_argument("--encoder_II_ckpt")
+    parser.add_argument("--config", default=None,
+                        help="Override fit settings (sdf/optimizer/scheduler/training blocks, "
+                             "model.decoder_layers); default: Encoder II's checkpoint config")
+    parser.add_argument("--data_root", default=None, help="Override data.root of the trained tasks")
+    parser.add_argument("--split", default="test", choices=["train", "val", "test"])
+    parser.add_argument("--skip_internal", action="store_true", help="Only evaluate external tasks")
+    parser.add_argument("--external_root", default=None, help="Folder with external Task*/dataset.json")
+    parser.add_argument("--external_tasks", nargs="+", default=None)
+    parser.add_argument("--external_label_groups", default="auto",
+                        help='"auto" or a JSON spec such as \'[["foreground"]]\'')
+    parser.add_argument("--arms", nargs="+", default=list(ARMS), choices=list(ARMS))
+    parser.add_argument("--steps", nargs="+", type=int, default=[250, 500, 1000, 2000, 4000])
+    parser.add_argument("--separate_fits", action="store_true",
+                        help="Fit each budget separately with its own schedule")
+    parser.add_argument("--train_encoder", action="store_true",
+                        help="Fit the whole network from the prior (default: frozen encoder)")
+    parser.add_argument("--no_native", action="store_true",
+                        help="Skip native-grid metrics (saves time/memory on very large CTs)")
+    parser.add_argument("--max_cases", type=int, default=None, help="Cap per case group")
+    parser.add_argument("--shard", default=None, help="i/n: evaluate the i-th of n case partitions")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--converged_tol", type=float, default=0.01)
+    parser.add_argument("--out", default="results/translation_test",
+                        help="Output prefix: <out>_per_label.csv and summary CSVs")
+    parser.add_argument("--resume", action="store_true", help="Continue an interrupted --out")
+    parser.add_argument("--merge", nargs="+", default=None,
+                        help="Summarize existing per-label CSVs (e.g. from shards) without fitting")
     args = parser.parse_args()
+
+    if args.merge:
+        report(read_rows(args.merge), args.out, args.converged_tol)
+        return
+    if not (args.encoder_I_ckpt and args.encoder_II_ckpt):
+        parser.error("--encoder_I_ckpt and --encoder_II_ckpt are required unless --merge")
 
     ckpt_I = load_model_weights(args.encoder_I_ckpt)
     ckpt_II = load_model_weights(args.encoder_II_ckpt)
+    cfg = resolve_fit_config(ckpt_I, ckpt_II, args.config, args.data_root)
+    trained_tasks = set(ckpt_I["config"]["data"]["tasks"]) | set(ckpt_II["config"]["data"]["tasks"])
+    spacing_mm = tuple(cfg["data"]["spacing_mm"])
+    alpha = cfg["sdf"]["alpha"]
+    decode_mode = cfg["sdf"].get("decode_mode", "independent")
+    device = resolve_device(cfg.get("training", {}).get("device", "auto"))
+    budgets = sorted(set(args.steps))
+    protocol = "finetune" if args.train_encoder else "frozen"
+    schedule = "separate_fits" if args.separate_fits else "single_fit"
+    encoders = {"enc_I": ckpt_I["encoder_state_dict"], "enc_II": ckpt_II["encoder_state_dict"],
+                "random": None}
 
-    assert ckpt_I["config"]["model"] == ckpt_II["config"]["model"], (
-        "Encoder I and Encoder II were trained with different model "
-        "architectures; their encoder weights are not comparable."
-    )
-    if ckpt_I["config"]["data"]["spacing_mm"] != ckpt_II["config"]["data"]["spacing_mm"]:
-        raise ValueError("Encoders were trained at different voxel spacings.")
+    refs = collect_cases(cfg, args, trained_tasks)
+    out_path = Path(f"{args.out}_per_label.csv")
+    done = set()
+    if args.resume and out_path.exists():
+        seen = {}
+        for r in read_rows([out_path]):
+            seen.setdefault((r["case_id"], r["arm"]), set()).add(int(r["steps"]))
+        done = {key for key, s in seen.items() if set(budgets) <= s}
+    writer = RowWriter(out_path, args.resume)
+    print(f"{len(refs)} cases x {len(args.arms)} arms, budgets {budgets} ({schedule}, {protocol} "
+          f"encoder), device {device}; {len(done)} case/arm fits already done")
 
-    # Both encoders must have been trained on the same tasks and the same
-    # split; otherwise "held-out" cases for one may have been training cases
-    # for the other.
-    data_I, data_II = ckpt_I["config"]["data"], ckpt_II["config"]["data"]
-    for key in ("tasks", "split"):
-        if data_I[key] != data_II[key]:
-            raise ValueError(f"Encoders were trained with different data.{key}: "
-                             f"{data_I[key]} vs {data_II[key]}")
+    first = True
+    for n, (group, dataset, i, case_id, groups_by_task, labels_by_task) in enumerate(refs, 1):
+        todo = [a for a in args.arms if (case_id, a) not in done]
+        if not todo:
+            continue
+        case, entry = dataset[i], dataset.data[i]
+        groups = groups_by_task[case["task"]]
+        sdf_case = prepare_sdf_case(case, entry["mask"], groups,
+                                    group_names(groups, labels_by_task[case["task"]]),
+                                    spacing_mm, alpha, native=not args.no_native)
+        seed = case_seed(args.seed, case_id)
+        print(f"\n[{n}/{len(refs)}] {group} {case_id} grid {sdf_case['shape']}, "
+              f"groups {dict(zip(sdf_case['names'], groups))}")
 
-    task_cfg = ckpt_II["config"]     # single source of truth for the task and fit settings
-    if args.data_root:
-        task_cfg["data"]["root"] = args.data_root
-    spacing_mm = tuple(task_cfg["data"]["spacing_mm"])
+        for arm in todo:
+            rows = []
 
-    # A fresh model is built per fit, so tasks may have different group counts.
-    groups_by_task = resolve_label_groups_per_task(task_cfg["sdf"]["label_groups"],
-                                                   load_tasks(task_cfg["data"]))
-    dataset = build_dataset(task_cfg["data"], split=args.split)
+            def on_eval(step, pred_sdf, fit_seconds):
+                ev = evaluate_sdf_fit(pred_sdf, sdf_case, decode_mode)
+                for lab in ev["labels"]:
+                    rows.append({"group": group, "task": case["task"], "case_id": case_id,
+                                 "arm": arm, "protocol": protocol, "schedule": schedule,
+                                 "steps": step, "fit_seconds": round(fit_seconds, 2),
+                                 "psnr": ev["psnr"], **lab})
+                per_label = " ".join(f"{lab['label']}={lab['native_dice']:.3f}/{lab['dice']:.3f}"
+                                     for lab in ev["labels"])
+                print(f"  {arm:<7} steps={step:>5} native/resampled dice: {per_label} "
+                      f"(mean {ev['native_mean_dice']:.4f}/{ev['mean_dice']:.4f}) {fit_seconds:.0f}s")
 
-    results = []
-    for case in dataset:
-        shape = tuple(case["mask"].shape[-3:])
-        coords = get_3d_coordinates(shape, spacing_mm).coords
-        label_groups = groups_by_task[case["task"]]
-        for steps in args.steps:
-            # Every fit builds the same architecture; summarize only the first.
-            r_I = fit_decoder_and_eval(ckpt_I["encoder_state_dict"], task_cfg, label_groups,
-                                       case, coords, spacing_mm, steps, summarize=not results)
-            r_II = fit_decoder_and_eval(ckpt_II["encoder_state_dict"], task_cfg, label_groups,
-                                        case, coords, spacing_mm, steps)
-            results.append({
-                "case_id": case["case_id"], "steps": steps,
-                **{f"enc_I_{k}": v for k, v in r_I.items()},
-                **{f"enc_II_{k}": v for k, v in r_II.items()},
-            })
-            print(f"case={case['case_id']} steps={steps} "
-                  f"enc_I_mean_dice={r_I['mean_dice']:.3f} enc_II_mean_dice={r_II['mean_dice']:.3f}")
+            fits = [(b, [b]) for b in budgets] if args.separate_fits else [(budgets[-1], budgets)]
+            for steps, eval_at in fits:
+                fit_sdf(cfg, sdf_case, steps, encoder_state_dict=encoders[arm],
+                        freeze_encoder=not args.train_encoder, device=device,
+                        eval_at=eval_at, on_eval=on_eval, seed=seed, summarize=first)
+                first = False
+            writer.write(rows)
 
-    with open(args.out_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(results[0].keys()))
-        writer.writeheader()
-        writer.writerows(results)
-    print(f"\nPer-sample results written to {args.out_csv}")
-
-    significance = run_significance_tests(results, args.steps)
-    print("\nWilcoxon signed-rank test (Encoder I vs Encoder II, paired per case):")
-    for row in significance:
-        print(f"  steps={row['steps']:>3} metric={row['metric']:<9} n={row['n_pairs']:<3} "
-              f"median_I={row['median_enc_I']:.3f} median_II={row['median_enc_II']:.3f} "
-              f"p={row['p_value']:.4f}")
+    print(f"\nPer-label results: {out_path}")
+    report(read_rows([out_path]), args.out, args.converged_tol)
 
 
 if __name__ == "__main__":

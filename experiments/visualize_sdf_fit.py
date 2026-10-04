@@ -15,9 +15,14 @@ mask is written twice:
 
 The prediction lives on the resampled grid (that is what the INR is fitted
 on). It is mapped back with the inverse of the two affines: original voxel
-index -> world (original affine) -> resampled voxel index (resampled affine),
-nearest-neighbour for labels, linear for SDFs. Orientation is never changed,
-so no axis flips or transposes are involved.
+index -> world (original affine) -> resampled voxel index (resampled affine).
+The predicted SDF is interpolated linearly and thresholded on the original
+grid, so the written masks are exactly the ones the native-grid Dice scores.
+Orientation is never changed, so no axis flips or transposes are involved.
+
+Fitting, seeding and scoring are shared with run_translation_test
+(training/sdf_fit.py): the same case, settings and encoder give the same
+numbers in both scripts.
 
 Label values: a group that is a single label keeps that label's id; any other
 group (e.g. [["foreground"]] or nested BraTS regions) gets value k + 1 and is
@@ -42,23 +47,17 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
-import torch
-from scipy.ndimage import affine_transform
 
 from utils.config import load_config
 from utils.io import load_model_weights
-from utils.metrics import per_label_metrics, dice_score
+from utils.metrics import per_label_metrics
 from data.dataset import build_dataset
 from data.msd import load_tasks, resolve_label_groups
-from sdf.coordinates import get_3d_coordinates
-from sdf.targets import (
-    create_multilabel_sdf, create_mask_sdf_with_clipping, build_channel_masks, sdf_to_channel_masks,
-)
-from models.interfaces import build_model, print_model_summary
-from training.losses import masked_eikonal_sdf_loss
-from training.train_loop import (
-    build_optimizer, build_scheduler, resolve_device, sample_points, predict_in_chunks,
-    DEFAULT_POINTS_PER_STEP,
+from sdf.targets import create_mask_sdf_with_clipping, build_channel_masks, sdf_to_channel_masks
+from training.train_loop import resolve_device
+from training.sdf_fit import (
+    as_affine, to_original_grid, group_names, group_label_values, masks_to_label_map, oracle_dice,
+    prepare_sdf_case, fit_sdf, evaluate_sdf_fit, case_seed,
 )
 
 
@@ -108,59 +107,10 @@ def load_case(data_cfg: dict, split: str, case_id: str, index: int):
     return dataset[index], dataset.data[index]
 
 
-# ---------------------------------------------------------------- fitting
-
-def fit_sdf(cfg, encoder_state_dict, coords, target, steps, train_encoder, device, scale,
-            summarize=True, log=True):
-    """Returns (full-volume prediction on CPU, final loss dict as floats)."""
-    sdf_cfg, train_cfg = cfg["sdf"], cfg.get("training", {})
-    model = build_model(cfg["model"], out_features=target.shape[-1]).to(device)
-    if encoder_state_dict is not None:
-        model.load_encoder_state_dict(encoder_state_dict, freeze=not train_encoder)
-    model.reset_decoder()
-    if summarize:
-        print_model_summary(model, title=f"STRAINER for SDF fit (out_features={target.shape[-1]})")
-
-    params = list(model.decoder_parameters())
-    if encoder_state_dict is None or train_encoder:
-        params += list(model.encoder_parameters())
-    optimizer = build_optimizer(params, cfg["optimizer"])
-    scheduler = build_scheduler(optimizer, cfg["scheduler"], steps)
-    points = train_cfg.get("points_per_step", DEFAULT_POINTS_PER_STEP)
-
-    coords, target = coords.to(device), target.to(device)
-    for step in range(steps):
-        optimizer.zero_grad()
-        coords_batch, target_batch = sample_points(coords, target, points, requires_grad=True)
-        pred = model.forward(coords_batch)
-        loss = masked_eikonal_sdf_loss(pred, coords_batch, target_batch,
-                                       sdf_cfg["alpha"], sdf_cfg["eikonal_lambda"],
-                                       mm_per_unit=scale)
-        loss["total"].backward()
-        optimizer.step()
-        scheduler.step()
-        if log and (step % max(steps // 10, 1) == 0 or step == steps - 1):
-            print(f"  step {step:>5}: loss={loss['total'].item():.5f} "
-                  f"mse={loss['mse'].item():.5f} eikonal={loss['eikonal'].item():.5f}")
-
-    final = {k: float(v.detach()) for k, v in loss.items()}
-    return predict_in_chunks(model, coords, train_cfg.get("eval_chunk_size", 2 ** 20)), final
-
-
 # ---------------------------------------------------------------- diagnostics
 
 def _status(ok: bool) -> str:
     return "PASS" if ok else "WARN"
-
-
-def oracle_dice(pred: np.ndarray, gt: np.ndarray) -> float:
-    """Dice of the |gt| lowest-predicted voxels: is the dip in the right place,
-    whatever its offset? High here with Dice 0 = right shape, wrong level."""
-    n = int(gt.sum())
-    if n == 0:
-        return float("nan")
-    threshold = np.partition(pred.ravel(), n - 1)[n - 1]
-    return dice_score(pred <= threshold, gt)
 
 
 def print_fit_diagnostics(pred_sdf, sdf_np, names, alpha):
@@ -191,7 +141,7 @@ def check_data(case, entry, groups, names, sdf_np, spacing_mm, alpha):
 
     image, mask = case["image"], case["mask"]
     same_shape = tuple(image.shape[-3:]) == tuple(mask.shape[-3:])
-    same_affine = np.allclose(_affine(image.affine), _affine(mask.affine), atol=1e-3)
+    same_affine = np.allclose(as_affine(image.affine), as_affine(mask.affine), atol=1e-3)
     print(f"  [{_status(same_shape and same_affine)}] 2. resampled image/mask grids: "
           f"shapes {tuple(image.shape[-3:])} vs {tuple(mask.shape[-3:])}, affines equal {same_affine}")
     raw_image = nib.load(entry["image"])
@@ -243,14 +193,12 @@ def crop_to_labels(sdf_np, spacing_mm, alpha):
     return sdf_np[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
 
 
-def run_control(label, target_np, cfg, encoder_state_dict, steps, train_encoder, device,
-                spacing_mm, names, decode_mode):
+def run_control(label, target_np, cfg, encoder_state_dict, steps, freeze_encoder, device,
+                spacing_mm, names, decode_mode, seed):
     shape, k = target_np.shape[:3], target_np.shape[-1]
-    grid = get_3d_coordinates(shape, spacing_mm)
-    target = torch.from_numpy(np.ascontiguousarray(target_np)).reshape(-1, k).float()
-    pred, final = fit_sdf(cfg, encoder_state_dict, grid.coords, target, steps, train_encoder,
-                          device, grid.mm_per_unit, summarize=False, log=False)
-    pred = pred.reshape(*shape, k).numpy()
+    control = {"shape": shape, "sdf": target_np, "spacing_mm": tuple(spacing_mm)}
+    pred, final = fit_sdf(cfg, control, steps, encoder_state_dict=encoder_state_dict,
+                          freeze_encoder=freeze_encoder, device=device, seed=seed)
     gt = target_np < 0.0
     metrics = per_label_metrics(sdf_to_channel_masks(pred, mode=decode_mode), gt, spacing_mm)
     print(f"  {label} on grid {shape}, {steps} steps: final mse {final['mse']:.4f} "
@@ -259,41 +207,6 @@ def run_control(label, target_np, cfg, encoder_state_dict, steps, train_encoder,
     for i, name in enumerate(names):
         print(f"    {name}: dice {metrics[f'dice_label{i}']:.4f}, "
               f"oracle-threshold dice {oracle_dice(pred[..., i], gt[..., i]):.4f}")
-
-
-# ---------------------------------------------------------------- labels / resampling
-
-def group_label_values(groups: list) -> list:
-    """Single-label groups keep their label id; any other group gets k + 1."""
-    if all(len(g) == 1 for g in groups):
-        return [g[0] for g in groups]
-    return list(range(1, len(groups) + 1))
-
-
-def masks_to_label_map(masks: np.ndarray, values: list) -> np.ndarray:
-    """(D, H, W, K) bool -> (D, H, W) uint8. Later groups paint over earlier
-    ones, so nested groups listed outer-to-inner show their innermost region."""
-    label_map = np.zeros(masks.shape[:3], dtype=np.uint8)
-    for k, value in enumerate(values):
-        label_map[masks[..., k]] = value
-    return label_map
-
-
-def to_original_grid(volume: np.ndarray, resampled_affine: np.ndarray,
-                     original_affine: np.ndarray, original_shape: tuple,
-                     order: int, cval: float = 0.0) -> np.ndarray:
-    """
-    Pull `volume` (on the resampled grid) onto the original voxel grid.
-    For each original voxel o: world = A_orig @ o, resampled index =
-    inv(A_res) @ world. affine_transform samples input at matrix @ o + offset.
-    """
-    m = np.linalg.inv(resampled_affine) @ original_affine
-    return affine_transform(volume, m[:3, :3], offset=m[:3, 3], output_shape=original_shape,
-                            order=order, mode="constant", cval=cval)
-
-
-def _affine(x) -> np.ndarray:
-    return np.asarray(x.cpu().numpy() if torch.is_tensor(x) else x, dtype=np.float64)
 
 
 def save_nifti(data: np.ndarray, affine: np.ndarray, path: Path, header=None):
@@ -331,6 +244,8 @@ def main():
                         help="Check labels/targets and run sphere + crop control fits")
     parser.add_argument("--control_steps", type=int, default=None,
                         help="Steps for each control fit (default: --steps)")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Base seed; per-case seeds match run_translation_test's")
     args = parser.parse_args()
 
     cfg, encoder_state_dict = resolve_config(args)
@@ -341,86 +256,76 @@ def main():
     case, entry = load_case(cfg["data"], args.split, args.case_id, args.index)
     task = next(t for t in load_tasks(cfg["data"]) if t.name == case["task"])
     groups = resolve_label_groups(sdf_cfg["label_groups"], task)
-    names = ["+".join(task.labels[i] for i in g) for g in groups]
+    names = group_names(groups, task.labels)
     out_dir = Path(args.out_dir or Path("visualizations") / case["case_id"])
     print(f"case {case['case_id']} ({args.split}), groups {dict(zip(names, groups))}, device {device}")
 
     # Prediction and target live on the resampled (isometric) grid.
-    mask = case["mask"]
-    shape = tuple(mask.shape[-3:])
-    resampled_affine = _affine(mask.affine)
-    label_map = mask[0].cpu().numpy()
-    sdf_np = create_multilabel_sdf(label_map, groups, spacing_mm, sdf_cfg["alpha"])
-    target = torch.from_numpy(sdf_np).reshape(-1, len(groups)).float()
-    grid = get_3d_coordinates(shape, spacing_mm)
+    sdf_case = prepare_sdf_case(case, entry["mask"], groups, names, spacing_mm, sdf_cfg["alpha"])
+    sdf_np, shape = sdf_case["sdf"], sdf_case["shape"]
+    resampled_affine = sdf_case["resampled_affine"]
     if args.diagnose:
         check_data(case, entry, groups, names, sdf_np, spacing_mm, sdf_cfg["alpha"])
 
-    source = "frozen encoder" if encoder_state_dict is not None and not args.train_encoder \
-        else "fine-tuned encoder" if encoder_state_dict is not None else "scratch"
-    print(f"fitting {args.steps} steps ({source}) on grid {shape}")
-    pred_sdf, _ = fit_sdf(cfg, encoder_state_dict, grid.coords, target, args.steps,
-                          args.train_encoder, device, grid.mm_per_unit)
-    pred_sdf = pred_sdf.reshape(*shape, len(groups)).numpy()
+    freeze = encoder_state_dict is not None and not args.train_encoder
+    source = "frozen encoder" if freeze else \
+        "fine-tuned encoder" if encoder_state_dict is not None else "scratch"
+    seed = case_seed(args.seed, case["case_id"])
+    print(f"fitting {args.steps} steps ({source}) on grid {shape}, seed {seed}")
+    pred_sdf, _ = fit_sdf(cfg, sdf_case, args.steps, encoder_state_dict=encoder_state_dict,
+                          freeze_encoder=freeze, device=device, seed=seed, summarize=True, log=True)
 
     decode_mode = sdf_cfg.get("decode_mode", "independent")
-    pred_masks = sdf_to_channel_masks(pred_sdf, mode=decode_mode)
-    metrics = per_label_metrics(pred_masks, sdf_np < 0.0, spacing_mm)
-    for k, name in enumerate(names):
-        print(f"  {name}: dice={metrics[f'dice_label{k}']:.4f} nsd={metrics[f'nsd_label{k}']:.4f}")
+    ev = evaluate_sdf_fit(pred_sdf, sdf_case, decode_mode, keep_masks=True)
+    for lab in ev["labels"]:
+        print(f"  {lab['label']}: native dice={lab['native_dice']:.4f} nsd={lab['native_nsd']:.4f} | "
+              f"resampled dice={lab['dice']:.4f} nsd={lab['nsd']:.4f}")
+    print(f"  mean: native dice={ev['native_mean_dice']:.4f} | resampled dice={ev['mean_dice']:.4f}")
     print_fit_diagnostics(pred_sdf, sdf_np, names, sdf_cfg["alpha"])
 
     if args.diagnose:
         steps = args.control_steps or args.steps
         print("\ncontrol fits (same config, grid spacing and device):")
         run_control("5. sphere control", sphere_control(sdf_np < 0.0, spacing_mm, sdf_cfg["alpha"]),
-                    cfg, encoder_state_dict, steps, args.train_encoder, device, spacing_mm, names,
-                    decode_mode)
+                    cfg, encoder_state_dict, steps, freeze, device, spacing_mm, names,
+                    decode_mode, seed)
         run_control("6. crop control", crop_to_labels(sdf_np, spacing_mm, sdf_cfg["alpha"]),
-                    cfg, encoder_state_dict, steps, args.train_encoder, device, spacing_mm, names,
-                    decode_mode)
+                    cfg, encoder_state_dict, steps, freeze, device, spacing_mm, names,
+                    decode_mode, seed)
         print("  Reading: sphere fits but real target doesn't -> label shape/size; crop fits but "
               "full volume doesn't -> imbalance/scale; data checks WARN or nothing fits -> data.\n")
 
     values = group_label_values(groups)
-    pred_labels = masks_to_label_map(pred_masks, values)
-    gt_labels = masks_to_label_map(sdf_np < 0.0, values)
     per_group = any(len(g) > 1 for g in groups)
 
     # Resampled grid: everything shares the affine MONAI computed in Spacingd.
     image = case["image"].cpu().numpy()                       # (C, D, H, W)
     image = image[0] if image.shape[0] == 1 else np.moveaxis(image, 0, -1)
     save_nifti(image.astype(np.float32), resampled_affine, out_dir / "resampled" / "image.nii.gz")
-    save_nifti(gt_labels, resampled_affine, out_dir / "resampled" / "gt_labels.nii.gz")
-    save_nifti(pred_labels, resampled_affine, out_dir / "resampled" / "pred_labels.nii.gz")
+    save_nifti(masks_to_label_map(sdf_np < 0.0, values), resampled_affine,
+               out_dir / "resampled" / "gt_labels.nii.gz")
+    save_nifti(masks_to_label_map(ev["pred_masks"], values), resampled_affine,
+               out_dir / "resampled" / "pred_labels.nii.gz")
     if args.save_sdf:
         for k, name in enumerate(names):
             save_nifti(pred_sdf[..., k].astype(np.float32), resampled_affine,
                        out_dir / "resampled" / f"pred_sdf_{name}.nii.gz")
 
-    # Original grid: map back through the affines and reuse the source label
-    # file's header, so the result overlays the raw MSD files exactly.
-    source_label = nib.load(entry["mask"])
-    original_shape = source_label.shape[:3]
-    original_affine = _affine(mask.meta.get("original_affine", source_label.affine))
-    if not np.allclose(original_affine, source_label.affine, atol=1e-3):
-        warnings.warn("MONAI's original_affine differs from the label file's header affine "
-                      "(reader qform/sform choice); outputs follow the header.")
-
-    def back(volume, order, cval=0.0):
-        return to_original_grid(volume, resampled_affine, original_affine, original_shape,
-                                order=order, cval=cval)
-
-    save_nifti(back(pred_labels, order=0), None, out_dir / "pred_labels.nii.gz",
-               header=source_label.header)
+    # Original grid: the masks the native Dice scored, written with the source
+    # label file's header so they overlay the raw MSD files exactly.
+    native = sdf_case["native"]
+    save_nifti(masks_to_label_map(ev["native_masks"], values), None, out_dir / "pred_labels.nii.gz",
+               header=native["header"])
     if per_group:
         for k, name in enumerate(names):
-            save_nifti(back(pred_masks[..., k].astype(np.uint8), order=0), None,
-                       out_dir / f"pred_{name}.nii.gz", header=source_label.header)
+            save_nifti(ev["native_masks"][..., k].astype(np.uint8), None,
+                       out_dir / f"pred_{name}.nii.gz", header=native["header"])
     if args.save_sdf:
         for k, name in enumerate(names):
-            save_nifti(back(pred_sdf[..., k].astype(np.float32), order=1, cval=sdf_cfg["alpha"]),
-                       None, out_dir / f"pred_sdf_{name}.nii.gz", header=source_label.header)
+            native_sdf = to_original_grid(pred_sdf[..., k].astype(np.float32), resampled_affine,
+                                          native["affine"], native["shape"], order=1,
+                                          cval=sdf_cfg["alpha"])
+            save_nifti(native_sdf, None, out_dir / f"pred_sdf_{name}.nii.gz", header=native["header"])
 
     print(f"\nOverlay {out_dir / 'pred_labels.nii.gz'} on\n  {entry['image']}\n  {entry['mask']}")
 
