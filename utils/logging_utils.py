@@ -4,11 +4,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-def configure_wandb(wandb_cfg: dict, experiment_name: str, full_config: dict):
+def configure_wandb(wandb_cfg: dict, experiment_name: str, full_config: dict, **init_kwargs):
+    """init_kwargs are passed to wandb.init (e.g. group, job_type)."""
     try:
         import wandb
         import os
-        wandb.login(key=os.environ.get("WANDB_API_KEY"))
+        # Offline/disabled runs need no account (and login would prompt for one).
+        if os.environ.get("WANDB_MODE") not in ("offline", "disabled"):
+            wandb.login(key=os.environ.get("WANDB_API_KEY"))
     except ImportError:
         print("wandb not installed; logging to stdout only.")
         return None
@@ -19,6 +22,7 @@ def configure_wandb(wandb_cfg: dict, experiment_name: str, full_config: dict):
         project=wandb_cfg["project"],
         name=run_name,
         config=full_config,
+        **init_kwargs,
     )
 
 

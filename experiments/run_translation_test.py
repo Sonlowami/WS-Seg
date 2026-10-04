@@ -24,6 +24,12 @@ Cases: the held-out --split of the tasks the encoders were trained on
 --shard i/n partitions the case list across jobs; --merge combines the
 shards' per-label CSVs into one summary.
 
+Results go to CSV and, unless --no_wandb, to Weights & Biases: every scored
+fit as it happens (keyed <group>/<arm>/...), and at the end the per-label
+rows and summary tables as wandb Tables, the headline medians and Holm
+p-values in the run summary, and the CSV files as an artifact. Use the same
+--wandb_group for all shards and their --merge run.
+
 Fairness: task and fit settings (alpha, eikonal_lambda, label_groups,
 decode_mode, optimizer, scheduler, points) come from ONE config -- Encoder
 II's checkpoint, or --config -- and apply to every arm. Each case uses one
@@ -44,19 +50,21 @@ Usage:
       --encoder_II_ckpt checkpoints/encoder_II_sdf \\
       --split test --steps 250 500 1000 2000 4000 \\
       --external_root /data/Decathlon --external_tasks Task09_Spleen \\
-      --shard 0/4 --out results/tt_shard0
+      --shard 0/4 --out results/tt_shard0 --wandb_group tt_frozen
   python -m experiments.run_translation_test --merge results/tt_shard*_per_label.csv \\
-      --out results/tt_all
+      --out results/tt_all --wandb_group tt_frozen --config config/encoder_II_sdf.yaml
 """
 import argparse
 import copy
 import csv
 import json
 import math
+import re
 from pathlib import Path
 
 from utils.config import load_config
 from utils.io import load_model_weights
+from utils.logging_utils import configure_wandb
 from utils.stats import ARMS, shard, summarize
 from data.dataset import build_dataset
 from data.msd import load_tasks, resolve_label_groups_per_task
@@ -65,6 +73,8 @@ from training.sdf_fit import prepare_sdf_case, fit_sdf, evaluate_sdf_fit, group_
 
 FIELDS = ["group", "task", "case_id", "arm", "protocol", "schedule", "steps", "fit_seconds",
           "psnr", "label", "gt_voxels", "dice", "nsd", "oracle_dice", "native_dice", "native_nsd"]
+INT_FIELDS = {"steps", "gt_voxels"}
+FLOAT_FIELDS = {"fit_seconds", "psnr", "dice", "nsd", "oracle_dice", "native_dice", "native_nsd"}
 
 
 # ---------------------------------------------------------------- config
@@ -137,10 +147,16 @@ def collect_cases(cfg: dict, args, trained_tasks: set) -> list:
 # ---------------------------------------------------------------- csv
 
 def read_rows(paths: list) -> list:
+    """Per-label rows with numeric fields parsed (NaN stays NaN)."""
     rows = []
     for path in paths:
         with open(path, newline="") as f:
-            rows += list(csv.DictReader(f))
+            for r in csv.DictReader(f):
+                for key in INT_FIELDS:
+                    r[key] = int(r[key])
+                for key in FLOAT_FIELDS:
+                    r[key] = float(r[key])
+                rows.append(r)
     return rows
 
 
@@ -163,6 +179,98 @@ class RowWriter:
         self.f.flush()
 
 
+# ---------------------------------------------------------------- wandb
+
+def _nanmean(values) -> float:
+    values = [float(v) for v in values if not math.isnan(float(v))]
+    return sum(values) / len(values) if values else float("nan")
+
+
+def _wandb_value(v):
+    """wandb tables and summaries take None, not NaN."""
+    return None if isinstance(v, float) and math.isnan(v) else v
+
+
+class WandbLogger:
+    """
+    Mirrors the CSVs in Weights & Biases. log_fit: one entry per scored fit
+    (case x arm x budget) as it happens. finish: the per-label rows and the
+    summary tables as wandb Tables, headline medians and Holm p-values in the
+    run summary, and the CSV files as an artifact. A no-op without a run.
+    """
+
+    def __init__(self, wandb_cfg: dict, name: str, config: dict, group: str, job_type: str):
+        self.run = None
+        if wandb_cfg is None:
+            return
+        # The training run_name would otherwise name this run too.
+        cfg = {k: v for k, v in wandb_cfg.items() if k != "run_name"}
+        self.run = configure_wandb(cfg, name, config, group=group, job_type=job_type)
+
+    def log_fit(self, rows: list):
+        if self.run is None or not rows:
+            return
+        r0 = rows[0]
+        prefix = f"{r0['group']}/{r0['arm']}"
+        data = {"case_id": r0["case_id"], "task": r0["task"], "budget": r0["steps"],
+                f"{prefix}/fit_seconds": r0["fit_seconds"], f"{prefix}/psnr": r0["psnr"]}
+        for metric in ("native_dice", "dice", "native_nsd", "nsd", "oracle_dice"):
+            data[f"{prefix}/mean_{metric}"] = _nanmean(r[metric] for r in rows)
+            for r in rows:
+                data[f"{prefix}/{metric}/{r['label']}"] = r[metric]
+        self.run.log({k: _wandb_value(v) for k, v in data.items()})
+
+    def finish(self, rows: list, summary: dict, files: list, artifact_name: str):
+        if self.run is None:
+            return
+        import wandb
+
+        def table(rs):
+            columns = list(rs[0].keys()) if rs else []
+            return wandb.Table(columns=columns,
+                               data=[[_wandb_value(r[c]) for c in columns] for r in rs])
+
+        self.run.log({"per_label": table(rows),
+                      **{f"summary/{name}": table(summary[name])
+                         for name in ("table", "tests", "convergence")}})
+        for r in summary["table"]:
+            for key, v in r.items():
+                if key.startswith("median_"):
+                    self.run.summary[f"{r['group']}/{r['arm']}/{key}@{r['steps']}"] = _wandb_value(v)
+        for t in summary["tests"]:
+            pair = t["pair"].replace(" ", "")
+            self.run.summary[f"{t['group']}/p_holm/{t['metric']}/{pair}@{t['steps']}"] = \
+                _wandb_value(t["p_holm"])
+        for c in summary["convergence"]:
+            self.run.summary[f"{c['group']}/{c['arm']}/converged/{c['metric']}"] = c["converged"]
+        artifact = wandb.Artifact(re.sub(r"[^A-Za-z0-9_.-]", "-", artifact_name),
+                                  type="translation_results")
+        for f in files:
+            if Path(f).exists():
+                artifact.add_file(str(f))
+        self.run.log_artifact(artifact)
+        self.run.finish()
+
+
+def wandb_settings(args, cfg: dict):
+    """The wandb block to log with (None = don't): the fit config's, else
+    --config's (for --merge), with --wandb_entity/--wandb_project on top."""
+    if args.no_wandb:
+        return None
+    block = dict((cfg or {}).get("wandb") or {})
+    if not block and args.config:
+        block = dict(load_config(args.config).get("wandb") or {})
+    if args.wandb_entity:
+        block["entity"] = args.wandb_entity
+    if args.wandb_project:
+        block["project"] = args.wandb_project
+    if not (block.get("entity") and block.get("project")):
+        print("No wandb entity/project (give --config with a wandb block or --wandb_entity "
+              "and --wandb_project); results go to CSV only.")
+        return None
+    return block
+
+
 def write_csv(path: Path, rows: list):
     if not rows:
         return
@@ -179,8 +287,9 @@ def report(rows: list, out: str, tol: float):
     metrics = ("native_dice", "dice") if has_native else ("dice",)
     headline = metrics[0]
     s = summarize(rows, metrics=metrics, tol=tol)
-    for name in ("table", "tests", "convergence"):
-        write_csv(Path(f"{out}_{name}.csv"), s[name])
+    files = [Path(f"{out}_{name}.csv") for name in ("table", "tests", "convergence")]
+    for name, path in zip(("table", "tests", "convergence"), files):
+        write_csv(path, s[name])
 
     print(f"\n==== {headline} (median of per-case means over label groups) ====")
     for group in sorted({r["group"] for r in s["table"]}):
@@ -206,6 +315,7 @@ def report(rows: list, out: str, tol: float):
                       f"{c['median_prev']:.4f} -> {c['median_last']:.4f} "
                       f"({c['change']:+.4f}, {flag} at tol {tol})")
     print(f"\nSummary CSVs: {out}_table.csv, {out}_tests.csv, {out}_convergence.csv")
+    return s, files
 
 
 # ---------------------------------------------------------------- main
@@ -241,10 +351,27 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Continue an interrupted --out")
     parser.add_argument("--merge", nargs="+", default=None,
                         help="Summarize existing per-label CSVs (e.g. from shards) without fitting")
+    parser.add_argument("--no_wandb", action="store_true", help="CSV only")
+    parser.add_argument("--wandb_entity", default=None, help="Override the config's wandb entity")
+    parser.add_argument("--wandb_project", default=None, help="Override the config's wandb project")
+    parser.add_argument("--wandb_name", default=None, help="Run name (default: basename of --out)")
+    parser.add_argument("--wandb_group", default=None,
+                        help="Group shards and their merge run together")
     args = parser.parse_args()
 
+    run_name = args.wandb_name or Path(args.out).name
     if args.merge:
-        report(read_rows(args.merge), args.out, args.converged_tol)
+        rows = read_rows(args.merge)
+        merged = Path(f"{args.out}_per_label.csv")
+        if merged.resolve() in {Path(m).resolve() for m in args.merge}:
+            raise SystemExit(f"--out would overwrite input {merged}; choose another --out.")
+        merged.parent.mkdir(parents=True, exist_ok=True)
+        write_csv(merged, rows)
+        logger = WandbLogger(wandb_settings(args, None), run_name,
+                             {"translation_test": vars(args)}, args.wandb_group,
+                             job_type="translation_test_merge")
+        summary, files = report(rows, args.out, args.converged_tol)
+        logger.finish(rows, summary, [merged, *files], artifact_name=f"translation-{run_name}")
         return
     if not (args.encoder_I_ckpt and args.encoder_II_ckpt):
         parser.error("--encoder_I_ckpt and --encoder_II_ckpt are required unless --merge")
@@ -272,6 +399,9 @@ def main():
             seen.setdefault((r["case_id"], r["arm"]), set()).add(int(r["steps"]))
         done = {key for key, s in seen.items() if set(budgets) <= s}
     writer = RowWriter(out_path, args.resume)
+    logger = WandbLogger(wandb_settings(args, cfg), run_name,
+                         {"translation_test": vars(args), "fit_config": cfg}, args.wandb_group,
+                         job_type="translation_test")
     print(f"{len(refs)} cases x {len(args.arms)} arms, budgets {budgets} ({schedule}, {protocol} "
           f"encoder), device {device}; {len(done)} case/arm fits already done")
 
@@ -294,11 +424,12 @@ def main():
 
             def on_eval(step, pred_sdf, fit_seconds):
                 ev = evaluate_sdf_fit(pred_sdf, sdf_case, decode_mode)
-                for lab in ev["labels"]:
-                    rows.append({"group": group, "task": case["task"], "case_id": case_id,
-                                 "arm": arm, "protocol": protocol, "schedule": schedule,
-                                 "steps": step, "fit_seconds": round(fit_seconds, 2),
-                                 "psnr": ev["psnr"], **lab})
+                new = [{"group": group, "task": case["task"], "case_id": case_id,
+                        "arm": arm, "protocol": protocol, "schedule": schedule,
+                        "steps": step, "fit_seconds": round(fit_seconds, 2),
+                        "psnr": ev["psnr"], **lab} for lab in ev["labels"]]
+                rows.extend(new)
+                logger.log_fit(new)
                 per_label = " ".join(f"{lab['label']}={lab['native_dice']:.3f}/{lab['dice']:.3f}"
                                      for lab in ev["labels"])
                 print(f"  {arm:<7} steps={step:>5} native/resampled dice: {per_label} "
@@ -313,7 +444,9 @@ def main():
             writer.write(rows)
 
     print(f"\nPer-label results: {out_path}")
-    report(read_rows([out_path]), args.out, args.converged_tol)
+    rows = read_rows([out_path])
+    summary, files = report(rows, args.out, args.converged_tol)
+    logger.finish(rows, summary, [out_path, *files], artifact_name=f"translation-{run_name}")
 
 
 if __name__ == "__main__":
