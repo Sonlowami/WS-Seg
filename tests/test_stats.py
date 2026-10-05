@@ -1,5 +1,5 @@
 import math
-from utils.stats import shard, case_means, paired_wilcoxon, holm_adjust, summarize
+from utils.stats import shard, case_means, paired_wilcoxon, holm_adjust, summarize, aggregate_cases
 
 
 def test_shards_partition_cases():
@@ -46,6 +46,24 @@ def test_summarize_tests_pairs_and_convergence():
     assert len(s["tests"]) == 6                                   # 2 budgets x 3 pairs
     conv = {r["arm"]: r for r in s["convergence"]}
     assert not conv["enc_I"]["converged"] and abs(conv["enc_I"]["change"] - 0.1) < 1e-9
+
+
+def test_aggregate_cases_by_config_and_label():
+    rows = []
+    for cfg, base in (("h256", 0.6), ("h512", 0.8)):
+        for i in range(3):
+            for label, d in (("PZ", base - 0.2), ("TZ", base + 0.1 * i)):
+                rows.append({"config": cfg, "steps": 100, "case_id": f"c{i}", "label": label,
+                             "native_dice": d, "dice": d, "native_nsd": d, "nsd": d, "oracle_dice": d})
+    rows.append({"config": "h512", "steps": 100, "case_id": "c3", "label": "PZ",       # absent label
+                 "native_dice": float("nan"), "dice": float("nan"), "native_nsd": float("nan"),
+                 "nsd": float("nan"), "oracle_dice": float("nan")})
+    overall = {r["config"]: r for r in aggregate_cases(rows, ("config", "steps"))}
+    assert overall["h256"]["n_dice"] == 3                       # c3 (all NaN) excluded
+    assert abs(overall["h256"]["mean_dice"] - 0.55) < 1e-9          # case means 0.5, 0.55, 0.6
+    per_label = {(r["config"], r["label"]): r for r in aggregate_cases(rows, ("config", "label"))}
+    assert abs(per_label[("h512", "PZ")]["mean_dice"] - 0.6) < 1e-9
+    assert per_label[("h512", "PZ")]["n_dice"] == 3
 
 
 if __name__ == "__main__":

@@ -9,9 +9,16 @@ mask is written twice:
   <out_dir>/pred_labels.nii.gz             original grid of the MSD label file,
   <out_dir>/pred_<group>.nii.gz            with that file's own header, so it
                                            overlays directly on imagesTr/labelsTr
+  <out_dir>/image[_<modality>].nii.gz      the raw image on that grid, one 3-D
+                                           file per modality (MSD stores
+                                           multi-modal images as one 4-D file)
   <out_dir>/resampled/{image,gt_labels,pred_labels}.nii.gz
                                            the isometric training grid, with
                                            the affine MONAI's Spacingd produced
+                                           (image_<modality>.nii.gz per modality)
+
+Every image is written 3-D, so each folder's images and label maps have the
+same dimensions and any viewer overlays them.
 
 The prediction lives on the resampled grid (that is what the INR is fitted
 on). It is mapped back with the inverse of the two affines: original voxel
@@ -42,6 +49,8 @@ real target cropped to its bounding box. Fit diagnostics (predicted SDF range,
 fraction below zero, oracle-threshold Dice) are always printed.
 """
 import argparse
+import re
+import time
 import warnings
 from pathlib import Path
 
@@ -209,6 +218,14 @@ def run_control(label, target_np, cfg, encoder_state_dict, steps, freeze_encoder
               f"oracle-threshold dice {oracle_dice(pred[..., i], gt[..., i]):.4f}")
 
 
+def image_channel_names(modalities: list, n_channels: int) -> list:
+    """[(file stem, channel)]: "image" for one channel, else image_<modality>."""
+    if n_channels == 1:
+        return [("image", 0)]
+    names = modalities if len(modalities) == n_channels else [f"c{c}" for c in range(n_channels)]
+    return [(f"image_{re.sub(r'[^A-Za-z0-9_.-]', '-', str(m))}", c) for c, m in enumerate(names)]
+
+
 def save_nifti(data: np.ndarray, affine: np.ndarray, path: Path, header=None):
     """With `header` (an original file's), keep its orientation codes and
     sform/qform as they are; otherwise mark the affine as scanner space."""
@@ -247,6 +264,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0,
                         help="Base seed; per-case seeds match run_translation_test's")
     args = parser.parse_args()
+    started = time.time()
 
     cfg, encoder_state_dict = resolve_config(args)
     sdf_cfg = cfg["sdf"]
@@ -299,9 +317,12 @@ def main():
     per_group = any(len(g) > 1 for g in groups)
 
     # Resampled grid: everything shares the affine MONAI computed in Spacingd.
+    # One 3-D file per modality: a 4-D (D, H, W, C) image would not match the
+    # 3-D label maps' dimensions in viewers.
     image = case["image"].cpu().numpy()                       # (C, D, H, W)
-    image = image[0] if image.shape[0] == 1 else np.moveaxis(image, 0, -1)
-    save_nifti(image.astype(np.float32), resampled_affine, out_dir / "resampled" / "image.nii.gz")
+    for name, channel in image_channel_names(task.modalities, image.shape[0]):
+        save_nifti(image[channel].astype(np.float32), resampled_affine,
+                   out_dir / "resampled" / f"{name}.nii.gz")
     save_nifti(masks_to_label_map(sdf_np < 0.0, values), resampled_affine,
                out_dir / "resampled" / "gt_labels.nii.gz")
     save_nifti(masks_to_label_map(ev["pred_masks"], values), resampled_affine,
@@ -314,6 +335,13 @@ def main():
     # Original grid: the masks the native Dice scored, written with the source
     # label file's header so they overlay the raw MSD files exactly.
     native = sdf_case["native"]
+    raw_image = nib.load(entry["image"])
+    raw_data = np.asarray(raw_image.dataobj)
+    n_raw = raw_data.shape[3] if raw_data.ndim == 4 else 1
+    for name, channel in image_channel_names(task.modalities, n_raw):
+        data = raw_data[..., channel] if raw_data.ndim == 4 else raw_data
+        save_nifti(np.asarray(data, dtype=np.float32), None, out_dir / f"{name}.nii.gz",
+                   header=raw_image.header)
     save_nifti(masks_to_label_map(ev["native_masks"], values), None, out_dir / "pred_labels.nii.gz",
                header=native["header"])
     if per_group:
@@ -327,7 +355,18 @@ def main():
                                           cval=sdf_cfg["alpha"])
             save_nifti(native_sdf, None, out_dir / f"pred_sdf_{name}.nii.gz", header=native["header"])
 
-    print(f"\nOverlay {out_dir / 'pred_labels.nii.gz'} on\n  {entry['image']}\n  {entry['mask']}")
+    # Files this run did not write (another case, or names an earlier version
+    # used) would otherwise be opened alongside these and not line up.
+    stale = sorted(f for f in out_dir.rglob("*.nii.gz") if f.stat().st_mtime < started)
+    if stale:
+        print(f"\nWARNING: {len(stale)} file(s) in {out_dir} are left over from an earlier run and "
+              f"may belong to another case or grid -- do not overlay them with this run's output:")
+        for f in stale:
+            print(f"  {f}  shape {nib.load(str(f)).shape}")
+        print("Delete them or use a fresh --out_dir.")
+
+    print(f"\nOverlay {out_dir / 'pred_labels.nii.gz'} on the image(s) in {out_dir}, or on\n"
+          f"  {entry['image']}\n  {entry['mask']}")
 
 
 if __name__ == "__main__":

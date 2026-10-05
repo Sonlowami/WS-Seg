@@ -56,7 +56,6 @@ Usage:
 """
 import argparse
 import copy
-import csv
 import json
 import math
 import re
@@ -65,16 +64,21 @@ from pathlib import Path
 from utils.config import load_config
 from utils.io import load_model_weights
 from utils.logging_utils import configure_wandb
+from utils.results_io import RowWriter, read_rows as _read_rows, write_csv
 from utils.stats import ARMS, shard, summarize
-from data.dataset import build_dataset
-from data.msd import load_tasks, resolve_label_groups_per_task
 from training.train_loop import resolve_device
-from training.sdf_fit import prepare_sdf_case, fit_sdf, evaluate_sdf_fit, group_names, case_seed
+from training.sdf_fit import case_seed
+from training.encoder_eval import load_case_refs, prepare_ref, score_encoder, format_progress
 
 FIELDS = ["group", "task", "case_id", "arm", "protocol", "schedule", "steps", "fit_seconds",
           "psnr", "label", "gt_voxels", "dice", "nsd", "oracle_dice", "native_dice", "native_nsd"]
 INT_FIELDS = {"steps", "gt_voxels"}
 FLOAT_FIELDS = {"fit_seconds", "psnr", "dice", "nsd", "oracle_dice", "native_dice", "native_nsd"}
+
+
+def read_rows(paths: list) -> list:
+    """Per-label rows with numeric fields parsed (NaN stays NaN)."""
+    return _read_rows(paths, INT_FIELDS, FLOAT_FIELDS)
 
 
 # ---------------------------------------------------------------- config
@@ -113,14 +117,24 @@ def resolve_fit_config(ckpt_I: dict, ckpt_II: dict, config_path: str, data_root:
 # ---------------------------------------------------------------- cases
 
 def collect_cases(cfg: dict, args, trained_tasks: set) -> list:
-    """[(group, dataset, index, case_id, groups_by_task, labels_by_task)],
+    """[(group, ref)] with refs from training/encoder_eval.load_case_refs,
     sorted, capped per group by --max_cases, then sharded."""
-    sources = []
+    if bool(args.external_root) != bool(args.external_tasks):
+        if not args.external_root:
+            raise SystemExit("--external_tasks needs --external_root (the folder holding them).")
+        root = Path(args.external_root)
+        found = sorted(d.name for d in root.iterdir() if (d / "dataset.json").is_file()) \
+            if root.is_dir() else []
+        listing = ", ".join(f"{t} (trained on, not allowed)" if t in trained_tasks else t
+                            for t in found) or "none -- is the path right?"
+        raise SystemExit(f"--external_root is set but --external_tasks is not, so no external cases "
+                         f"would be evaluated. Tasks with a dataset.json under {root}: {listing}")
+
+    refs, group_names_seen = [], []
     if not args.skip_internal:
-        tasks = load_tasks(cfg["data"])
-        sources.append(("internal", build_dataset(cfg["data"], split=args.split),
-                        resolve_label_groups_per_task(cfg["sdf"]["label_groups"], tasks),
-                        {t.name: t.labels for t in tasks}))
+        refs += [("internal", r) for r in load_case_refs(
+            cfg["data"], cfg["sdf"]["label_groups"], args.split, args.max_cases)]
+        group_names_seen.append("internal")
     if args.external_tasks:
         overlap = set(args.external_tasks) & trained_tasks
         if overlap:
@@ -129,55 +143,19 @@ def collect_cases(cfg: dict, args, trained_tasks: set) -> list:
         ext_cfg = {"root": args.external_root, "tasks": args.external_tasks,
                    "spacing_mm": cfg["data"]["spacing_mm"]}
         spec = "auto" if args.external_label_groups == "auto" else json.loads(args.external_label_groups)
-        tasks = load_tasks(ext_cfg)
-        sources.append(("external", build_dataset(ext_cfg, split="all"),
-                        resolve_label_groups_per_task(spec, tasks), {t.name: t.labels for t in tasks}))
-    if not sources:
+        refs += [("external", r) for r in load_case_refs(ext_cfg, spec, "all", args.max_cases)]
+        group_names_seen.append("external")
+    if not group_names_seen:
         raise SystemExit("Nothing to evaluate: --skip_internal without --external_tasks.")
 
-    refs = []
-    for group, dataset, groups, labels in sources:
-        ids = sorted((e["case_id"], i) for i, e in enumerate(dataset.data))
-        if args.max_cases:
-            ids = ids[:args.max_cases]
-        refs += [(group, dataset, i, case_id, groups, labels) for case_id, i in ids]
-    return shard(refs, args.shard, key=lambda r: (r[0], r[3]))
+    selected = shard(refs, args.shard, key=lambda r: (r[0], r[1][0]))
+    counts = {g: sum(r[0] == g for r in selected) for g in group_names_seen}
+    print("cases to evaluate" + (f" (shard {args.shard})" if args.shard else "") + ": "
+          + ", ".join(f"{g} {n}" for g, n in counts.items()))
+    return selected
 
 
 # ---------------------------------------------------------------- csv
-
-def read_rows(paths: list) -> list:
-    """Per-label rows with numeric fields parsed (NaN stays NaN)."""
-    rows = []
-    for path in paths:
-        with open(path, newline="") as f:
-            for r in csv.DictReader(f):
-                for key in INT_FIELDS:
-                    r[key] = int(r[key])
-                for key in FLOAT_FIELDS:
-                    r[key] = float(r[key])
-                rows.append(r)
-    return rows
-
-
-class RowWriter:
-    """Appends per-label rows and flushes after each fit, so an interrupted
-    run keeps everything finished so far (see --resume)."""
-
-    def __init__(self, path: Path, resume: bool):
-        if path.exists() and not resume:
-            raise SystemExit(f"{path} exists; pass --resume to continue it or choose another --out.")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        new = not path.exists()
-        self.f = open(path, "a", newline="")
-        self.writer = csv.DictWriter(self.f, fieldnames=FIELDS)
-        if new:
-            self.writer.writeheader()
-
-    def write(self, rows: list):
-        self.writer.writerows(rows)
-        self.f.flush()
-
 
 # ---------------------------------------------------------------- wandb
 
@@ -269,15 +247,6 @@ def wandb_settings(args, cfg: dict):
               "and --wandb_project); results go to CSV only.")
         return None
     return block
-
-
-def write_csv(path: Path, rows: list):
-    if not rows:
-        return
-    with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-        writer.writeheader()
-        writer.writerows(rows)
 
 
 # ---------------------------------------------------------------- summary
@@ -382,7 +351,6 @@ def main():
     trained_tasks = set(ckpt_I["config"]["data"]["tasks"]) | set(ckpt_II["config"]["data"]["tasks"])
     spacing_mm = tuple(cfg["data"]["spacing_mm"])
     alpha = cfg["sdf"]["alpha"]
-    decode_mode = cfg["sdf"].get("decode_mode", "independent")
     device = resolve_device(cfg.get("training", {}).get("device", "auto"))
     budgets = sorted(set(args.steps))
     protocol = "finetune" if args.train_encoder else "frozen"
@@ -398,7 +366,7 @@ def main():
         for r in read_rows([out_path]):
             seen.setdefault((r["case_id"], r["arm"]), set()).add(int(r["steps"]))
         done = {key for key, s in seen.items() if set(budgets) <= s}
-    writer = RowWriter(out_path, args.resume)
+    writer = RowWriter(out_path, FIELDS, args.resume)
     logger = WandbLogger(wandb_settings(args, cfg), run_name,
                          {"translation_test": vars(args), "fit_config": cfg}, args.wandb_group,
                          job_type="translation_test")
@@ -406,42 +374,28 @@ def main():
           f"encoder), device {device}; {len(done)} case/arm fits already done")
 
     first = True
-    for n, (group, dataset, i, case_id, groups_by_task, labels_by_task) in enumerate(refs, 1):
+    for n, (group, ref) in enumerate(refs, 1):
+        case_id = ref[0]
         todo = [a for a in args.arms if (case_id, a) not in done]
         if not todo:
             continue
-        case, entry = dataset[i], dataset.data[i]
-        groups = groups_by_task[case["task"]]
-        sdf_case = prepare_sdf_case(case, entry["mask"], groups,
-                                    group_names(groups, labels_by_task[case["task"]]),
-                                    spacing_mm, alpha, native=not args.no_native)
+        sdf_case = prepare_ref(ref, spacing_mm, alpha, native=not args.no_native)
         seed = case_seed(args.seed, case_id)
         print(f"\n[{n}/{len(refs)}] {group} {case_id} grid {sdf_case['shape']}, "
-              f"groups {dict(zip(sdf_case['names'], groups))}")
+              f"groups {dict(zip(sdf_case['names'], sdf_case['groups']))}")
 
         for arm in todo:
-            rows = []
+            meta = {"group": group, "arm": arm, "protocol": protocol, "schedule": schedule}
 
-            def on_eval(step, pred_sdf, fit_seconds):
-                ev = evaluate_sdf_fit(pred_sdf, sdf_case, decode_mode)
-                new = [{"group": group, "task": case["task"], "case_id": case_id,
-                        "arm": arm, "protocol": protocol, "schedule": schedule,
-                        "steps": step, "fit_seconds": round(fit_seconds, 2),
-                        "psnr": ev["psnr"], **lab} for lab in ev["labels"]]
-                rows.extend(new)
-                logger.log_fit(new)
-                per_label = " ".join(f"{lab['label']}={lab['native_dice']:.3f}/{lab['dice']:.3f}"
-                                     for lab in ev["labels"])
-                print(f"  {arm:<7} steps={step:>5} native/resampled dice: {per_label} "
-                      f"(mean {ev['native_mean_dice']:.4f}/{ev['mean_dice']:.4f}) {fit_seconds:.0f}s")
+            def on_rows(new, ev):
+                logger.log_fit([{**meta, **r} for r in new])
+                print(format_progress(arm, new, ev))
 
-            fits = [(b, [b]) for b in budgets] if args.separate_fits else [(budgets[-1], budgets)]
-            for steps, eval_at in fits:
-                fit_sdf(cfg, sdf_case, steps, encoder_state_dict=encoders[arm],
-                        freeze_encoder=not args.train_encoder, device=device,
-                        eval_at=eval_at, on_eval=on_eval, seed=seed, summarize=first)
-                first = False
-            writer.write(rows)
+            rows = score_encoder(cfg, sdf_case, encoders[arm], budgets,
+                                 freeze_encoder=not args.train_encoder, device=device, seed=seed,
+                                 separate_fits=args.separate_fits, summarize=first, on_rows=on_rows)
+            first = False
+            writer.write([{**meta, **r} for r in rows])
 
     print(f"\nPer-label results: {out_path}")
     rows = read_rows([out_path])

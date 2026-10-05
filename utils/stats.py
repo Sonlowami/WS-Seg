@@ -145,3 +145,29 @@ def summarize(rows: list, metrics=("native_dice", "dice"), tol: float = 0.01) ->
                                         "change": change,
                                         "converged": (not math.isnan(change)) and abs(change) < tol})
     return {"table": table, "tests": tests, "convergence": convergence}
+
+
+def aggregate_cases(rows: list, by: tuple, metrics=CASE_METRICS) -> list:
+    """
+    Summaries over cases for every combination of the `by` fields: each case
+    is first averaged over its label rows (NaN labels excluded, as in
+    case_means), then n / mean / median are taken across cases. Pass a
+    `by` that includes "label" for per-label summaries.
+    """
+    per_case = {}
+    for r in rows:
+        per_case.setdefault(tuple(r[k] for k in by) + (r["case_id"],), []).append(r)
+    grouped = {}
+    for key, rs in per_case.items():
+        grouped.setdefault(key[:-1], []).append(
+            {m: _nanmean(float(r[m]) for r in rs) for m in metrics})
+    out = []
+    for key in sorted(grouped, key=lambda k: tuple(str(x) for x in k)):
+        row = dict(zip(by, key))
+        for m in metrics:
+            vals = [c[m] for c in grouped[key] if not math.isnan(c[m])]
+            row[f"n_{m}"] = len(vals)
+            row[f"mean_{m}"] = float(np.mean(vals)) if vals else float("nan")
+            row[f"median_{m}"] = float(np.median(vals)) if vals else float("nan")
+        out.append(row)
+    return out

@@ -40,16 +40,13 @@ def metric_fn(pred, target, shape, channels):
     }
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--data_root", default=None,
-                        help="Override data.root (paths differ between machines)")
-    args = parser.parse_args()
-
-    cfg = load_config(args.config)
-    if args.data_root:
-        cfg["data"]["root"] = args.data_root
+def train_encoder_I(cfg: dict, wandb_kwargs: dict = None) -> dict:
+    """
+    Train Encoder I (image intensities) as configured: joint or sequential.
+    cfg: a full training config (experiment_name names the wandb run).
+    wandb_kwargs: extra wandb.init arguments, e.g. group for a sweep.
+    Returns the trained encoder's state_dict; the wandb run is finished.
+    """
     assert cfg["target_signal"] == "intensity", (
         "This entrypoint is for Encoder I (intensity) only. "
         "Use run_encoder_II.py for the SDF encoder."
@@ -87,7 +84,8 @@ def main():
         model = build_model(cfg["model"], out_features=channels, num_decoders=len(items))
         print_model_summary(model, title=f"Encoder I STRAINER, {len(items)} heads "
                                          f"(out_features={channels})")
-        wandb_run = configure_wandb(cfg["wandb"], cfg["experiment_name"], cfg)
+        wandb_run = configure_wandb(cfg["wandb"], cfg["experiment_name"], cfg,
+                                    **(wandb_kwargs or {}))
         encoder_state_dict = train_encoder_jointly(
             items=items, model=model, steps=train_cfg["steps"],
             log_every_n_steps=train_cfg["log_every_n_epochs"], wandb_run=wandb_run,
@@ -95,7 +93,8 @@ def main():
     elif mode == "sequential":
         model = build_model(cfg["model"], out_features=channels)
         print_model_summary(model, title=f"Encoder I STRAINER (out_features={channels})")
-        wandb_run = configure_wandb(cfg["wandb"], cfg["experiment_name"], cfg)
+        wandb_run = configure_wandb(cfg["wandb"], cfg["experiment_name"], cfg,
+                                    **(wandb_kwargs or {}))
 
         def coords_fn(case):
             shape = tuple(case["image"].shape[-3:])
@@ -109,6 +108,22 @@ def main():
     else:
         raise SystemExit(f"Unknown training.mode {mode!r}; use 'joint' or 'sequential'.")
 
+    if wandb_run is not None:
+        wandb_run.finish()
+    return encoder_state_dict
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--data_root", default=None,
+                        help="Override data.root (paths differ between machines)")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+    if args.data_root:
+        cfg["data"]["root"] = args.data_root
+    encoder_state_dict = train_encoder_I(cfg)
     save_encoder_weights(encoder_state_dict, cfg, out_dir=f"checkpoints/{cfg['experiment_name']}")
 
 
