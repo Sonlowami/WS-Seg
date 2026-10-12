@@ -86,7 +86,7 @@ def train_or_load(tag: str, cfg: dict, ckpt_dir: Path, resume: bool, sweep: str)
                 "train_seconds": ckpt["config"].get("sweep", {}).get("train_seconds", float("nan"))}
     print(f"\n[{tag}] training {cfg['target_signal']} encoder {cfg['model']}")
     t0 = time.time()
-    state_dict = trainer_for(cfg["target_signal"])(
+    state_dict =    trainer_for(cfg["target_signal"])(
         cfg, wandb_kwargs={"group": sweep, "job_type": "encoder_sweep"})
     seconds = time.time() - t0
     cfg["sweep"] = {"name": sweep, "tag": tag, "train_seconds": round(seconds, 1)}
@@ -165,7 +165,7 @@ def main():
     done = set()
     if args.resume and out_path.exists():
         seen = {}
-        for r in read_rows([out_path], INT_FIELDS, FLOAT_FIELDS):
+        for r in read_rows([out_path], INT_FIELDS, FLOAT_FIELDS, FIELDS):
             seen.setdefault((r["config"], r["arm"], r["case_id"]), set()).add(r["steps"])
         done = {k for k, s in seen.items() if set(args.steps) <= s}
     writer = RowWriter(out_path, FIELDS, args.resume)
@@ -208,7 +208,7 @@ def main():
                 on_rows=lambda new, ev, label=f"{tag}/{arm}": print(format_progress(label, new, ev)))
             writer.write([{**meta, **r} for r in rows])
 
-    report(read_rows([out_path], INT_FIELDS, FLOAT_FIELDS), points, args.out)
+    report(read_rows([out_path], INT_FIELDS, FLOAT_FIELDS, FIELDS), points, args.out)
 
 
 if __name__ == "__main__":

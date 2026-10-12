@@ -78,7 +78,7 @@ FLOAT_FIELDS = {"fit_seconds", "psnr", "dice", "nsd", "oracle_dice", "native_dic
 
 def read_rows(paths: list) -> list:
     """Per-label rows with numeric fields parsed (NaN stays NaN)."""
-    return _read_rows(paths, INT_FIELDS, FLOAT_FIELDS)
+    return _read_rows(paths, INT_FIELDS, FLOAT_FIELDS, FIELDS)
 
 
 # ---------------------------------------------------------------- config
