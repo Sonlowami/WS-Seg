@@ -5,10 +5,10 @@ Usage: python -m experiments.run_encoder_I --config config/encoder_I_intensity.y
 """
 import argparse
 from torch.utils.data import DataLoader
-
+from utils.metrics import metric_fn
 from utils.config import load_config
 from utils.logging_utils import configure_wandb
-from utils.metrics import psnr_3d, ssim_3d
+
 from utils.io import save_encoder_weights
 from data.dataset import build_dataset
 from data.msd import load_tasks, shared_image_channels
@@ -25,16 +25,6 @@ def target_extractor(case):
     # Encoder I needs no coordinate gradients: intensities carry no
     # Eikonal constraint, unlike Encoder II's SDF targets.
     return target, {"needs_coord_grad": False, "loss_kwargs": {}}
-
-
-def metric_fn(pred, target, shape, channels):
-    full_shape = (*shape, channels)
-    pred_vol = pred.reshape(full_shape).cpu().numpy()
-    target_vol = target.reshape(full_shape).cpu().numpy()
-    return {
-        "psnr": psnr_3d(pred_vol, target_vol),
-        "ssim": ssim_3d(pred_vol, target_vol, channel_axis=-1),
-    }
 
 
 def train_encoder_I(cfg: dict, wandb_kwargs: dict = None) -> dict:
