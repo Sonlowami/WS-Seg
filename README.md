@@ -11,7 +11,7 @@ models/interfaces.py          EncoderDecoderINR protocol + build_model() factory
 sdf/coordinates.py            get_3d_coordinates: physical-space coordinate grid
 sdf/targets.py                create_mask_sdf_with_clipping, create_multilabel_sdf, sdf_to_channel_masks
 training/losses.py            image_reconstruction_loss (Encoder I), masked_eikonal_sdf_loss (Encoder II)
-training/train_loop.py        Shared train_encoder_decoder loop, used by both encoders
+training/train_loop.py        train_encoder_jointly: STRAINER-style encoder training, used by both encoders
 data/transforms.py            MONAI preprocessing: isometric spacing + z-norm
 data/msd.py                    Reads each task's dataset.json directly; seeded, persisted splits (no torch/monai)
 data/dataset.py                Thin MONAI dataset wrapper over data/msd.py

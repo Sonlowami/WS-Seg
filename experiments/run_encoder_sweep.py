@@ -3,7 +3,7 @@ Encoder size sweep: how do encoder width and depth change the prior?
 
 For every combination of --hidden_dims x --encoder_layers:
   1. train an encoder with the config's own training (Encoder I or II,
-     chosen by target_signal; joint/sequential as configured) and save it
+     chosen by target_signal) and save it
      to <checkpoint_dir>/<sweep>/h<width>_L<depth>/
   2. use it as the prior for fitting a fresh SDF decoder to every evaluation
      case (the same fitting and scoring code as run_translation_test) and
