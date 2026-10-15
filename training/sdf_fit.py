@@ -11,7 +11,6 @@ Two grids are scored:
              back with linear interpolation and thresholded there, which is
              more faithful than nearest-neighbour on an already-binary mask.
 """
-import time
 import warnings
 import zlib
 
@@ -21,13 +20,11 @@ import torch
 from scipy.ndimage import affine_transform
 
 from utils.metrics import per_label_metrics, dice_score, psnr_3d
-from sdf.coordinates import coords_from_indices, mm_per_unit
+from sdf.coordinates import mm_per_unit
 from sdf.targets import create_multilabel_sdf, build_channel_masks, sdf_to_channel_masks
 from models.interfaces import build_model, print_model_summary
 from training.losses import masked_eikonal_sdf_loss
-from training.train_loop import (
-    build_optimizer, build_scheduler, predict_volume, DEFAULT_POINTS_PER_STEP,
-)
+from training.train_loop import fit_inr, DEFAULT_POINTS_PER_STEP
 
 
 # ---------------------------------------------------------------- geometry
@@ -158,46 +155,23 @@ def fit_sdf(cfg: dict, sdf_case: dict, steps: int, encoder_state_dict: dict = No
         if cuda_states is not None:
             torch.cuda.set_rng_state_all(cuda_states)
 
-    optimizer = build_optimizer([p for p in model.parameters() if p.requires_grad], cfg["optimizer"])
-    scheduler = build_scheduler(optimizer, cfg["scheduler"], steps)
-    target = torch.from_numpy(np.ascontiguousarray(sdf_case["sdf"])).reshape(-1, k).float().to(device)
-    n = target.shape[0]
-    points = train_cfg.get("points_per_step", DEFAULT_POINTS_PER_STEP)
+    target = torch.from_numpy(np.ascontiguousarray(sdf_case["sdf"])).reshape(-1, k).float()
     scale = mm_per_unit(shape, spacing)
-    chunk = train_cfg.get("eval_chunk_size", 2 ** 20)
-    eval_at = set(eval_at)
 
-    def predict():
-        return predict_volume(model, shape, spacing, 0, chunk, device).reshape(*shape, k).numpy()
-
-    def sync():
-        if torch.device(device).type == "cuda":
-            torch.cuda.synchronize(device)
-
-    fit_seconds, last_pred = 0.0, None
-    for step in range(1, steps + 1):
-        t0 = time.perf_counter()
-        optimizer.zero_grad(set_to_none=True)
-        idx = (torch.arange(n, device=device) if points is None
-               else torch.randint(n, (points,), device=device))
-        coords = coords_from_indices(idx, shape, spacing).requires_grad_(True)
-        pred = model.forward(coords)
-        loss = masked_eikonal_sdf_loss(pred, coords, target[idx], sdf_cfg["alpha"],
+    def loss_fn(pred, coords, target_batch):
+        return masked_eikonal_sdf_loss(pred, coords, target_batch, sdf_cfg["alpha"],
                                        sdf_cfg["eikonal_lambda"], mm_per_unit=scale)
-        loss["total"].backward()
-        optimizer.step()
-        scheduler.step()
-        sync()
-        fit_seconds += time.perf_counter() - t0
-        if log and (step % max(steps // 10, 1) == 0 or step in (1, steps)):
-            print(f"  step {step:>5}: loss={loss['total'].item():.5f} "
-                  f"mse={loss['mse'].item():.5f} eikonal={loss['eikonal'].item():.5f}")
-        if step in eval_at and on_eval is not None:
-            last_pred = predict()
-            on_eval(step, last_pred, fit_seconds)
 
-    final = {key: float(v.detach()) for key, v in loss.items()}
-    return (last_pred if steps in eval_at and last_pred is not None else predict()), final
+    def as_volume(pred):
+        return pred.reshape(*shape, k).numpy()
+
+    pred, final = fit_inr(
+        model, target, shape, spacing, loss_fn, steps, cfg["optimizer"], cfg["scheduler"],
+        points_per_step=train_cfg.get("points_per_step", DEFAULT_POINTS_PER_STEP),
+        eval_chunk_size=train_cfg.get("eval_chunk_size", 2 ** 20), device=device, eval_at=eval_at,
+        on_eval=None if on_eval is None else (lambda step, p, t: on_eval(step, as_volume(p), t)),
+        log=log)
+    return as_volume(pred), final
 
 
 # ---------------------------------------------------------------- evaluation

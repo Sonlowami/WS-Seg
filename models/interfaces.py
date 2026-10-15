@@ -6,6 +6,7 @@ specific INR library. This keeps the option open to plug in Alpine's
 `Strainer`/`Siren` classes (recommended starting point, see project README)
 or a hand-rolled SIREN without touching the training loop.
 """
+import warnings
 from typing import Protocol, runtime_checkable
 import torch
 
@@ -41,6 +42,8 @@ class EncoderDecoderINR(Protocol):
     def decoder_state_dict(self) -> dict: ...
 
     def load_encoder_state_dict(self, state_dict: dict, freeze: bool = False) -> None: ...
+
+    def load_decoder_state_dict(self, state_dict: dict) -> None: ...
 
 
 def build_model(model_cfg: dict, out_features: int, num_decoders: int = 1) -> EncoderDecoderINR:
@@ -78,6 +81,24 @@ def build_model(model_cfg: dict, out_features: int, num_decoders: int = 1) -> En
         num_decoders=num_decoders,
         omegas=[float(model_cfg.get("omega", 30.0))],
     )
+
+
+def merge_model_config(encoder_model_cfg: dict, cfg_model: dict = None) -> dict:
+    """
+    Architecture for fitting a fresh decoder on a saved encoder: every key
+    that shapes the encoder comes from the encoder's checkpoint config (its
+    weights load into nothing else); decoder_layers may come from cfg_model,
+    since the decoder is always newly built. Warns if cfg_model disagrees on
+    an encoder key.
+    """
+    cfg_model = cfg_model or {}
+    differing = [k for k in encoder_model_cfg
+                 if k != "decoder_layers" and cfg_model.get(k, encoder_model_cfg[k]) != encoder_model_cfg[k]]
+    if differing:
+        warnings.warn(f"config model keys {differing} differ from the encoder checkpoint's; "
+                      f"using the checkpoint's values (they define the encoder).")
+    return {**encoder_model_cfg,
+            "decoder_layers": cfg_model.get("decoder_layers", encoder_model_cfg["decoder_layers"])}
 
 
 def print_model_summary(model: EncoderDecoderINR, n_points: int = 4096,

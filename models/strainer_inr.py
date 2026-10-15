@@ -45,6 +45,9 @@ class STRAINER_INR(Strainer, EncoderDecoderINR):
     def decoder_state_dict(self) -> dict:
         return self.decoder.state_dict()
 
+    def load_decoder_state_dict(self, state_dict: dict) -> None:
+        self.decoder.load_state_dict(state_dict)
+
     def load_encoder_state_dict(self, state_dict: dict, freeze: bool = False) -> None:
         super().load_encoder_weights(state_dict)
         if freeze:

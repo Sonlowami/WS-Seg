@@ -19,10 +19,16 @@ def save_encoder_weights(encoder_state_dict: dict, config: dict, out_dir: str) -
 
 
 def save_decoder_weights(decoder_state_dict: dict, case_id: str, out_dir: str) -> Path:
+    """
+    Save one case's decoder as <out_dir>/decoder_<case_id>.pt and return that
+    path. Case ids such as "Task05_Prostate/prostate_00/T2" contain slashes,
+    which are flattened to "__" so every decoder is one file in out_dir.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    torch.save(decoder_state_dict, out_dir / f"decoder_{case_id}.pt")
-    return out_dir
+    path = out_dir / f"decoder_{case_id.replace('/', '__')}.pt"
+    torch.save(decoder_state_dict, path)
+    return path
 
 
 def load_model_weights(checkpoint_dir: str, map_location: str = "cpu") -> dict:

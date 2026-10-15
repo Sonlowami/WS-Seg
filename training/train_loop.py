@@ -7,7 +7,13 @@ shared across the whole set. After training only the encoder is kept.
 The same loop trains Encoder I (intensity) and Encoder II (SDF); only the
 loss, metrics and target extraction differ, injected by the caller
 (experiments/run_encoder_I.py, experiments/run_encoder_II.py).
+
+fit_inr is the single-signal counterpart: fit one model (typically a fresh
+decoder on a fixed encoder) to one case. It backs SDF fitting
+(training/sdf_fit.py) and per-image decoder training
+(experiments/run_decoder_training.py).
 """
+import time
 from typing import Callable
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR
@@ -83,6 +89,57 @@ def predict_volume(model, shape: tuple, spacing_mm: tuple, decoder_index: int = 
         idx = torch.arange(start, min(start + chunk_size, n), device=device)
         out.append(model.forward(coords_from_indices(idx, shape, spacing_mm), decoder_index).cpu())
     return torch.cat(out)
+
+
+def fit_inr(model: EncoderDecoderINR, target: torch.Tensor, shape: tuple, spacing_mm: tuple,
+            loss_fn: Callable, steps: int, optimizer_cfg: dict, scheduler_cfg: dict,
+            points_per_step: int = DEFAULT_POINTS_PER_STEP, eval_chunk_size: int = 2 ** 20,
+            device="cpu", eval_at=(), on_eval: Callable = None, log: bool = False):
+    """
+    Fit head 0 of `model` to one signal for `steps` optimizer steps, each on a
+    random batch of points_per_step voxels (None = every voxel).
+
+    target: (N, C) over the grid `shape` (C-order flattened, as coords_from_indices).
+    loss_fn(pred, coords, target_batch) -> dict with "total"; coords require
+        grad, so losses may differentiate through them (the Eikonal term).
+    Only parameters with requires_grad are optimized: freeze the encoder to
+    fit a decoder alone. Callers seed torch beforehand for reproducible batches.
+    eval_at / on_eval: after each step count in eval_at, on_eval(step,
+        prediction (N, C) on CPU, fit_seconds) is called; fit_seconds excludes
+        evaluation time. The lr schedule always spans `steps`.
+    Returns (full prediction (N, C) on CPU after `steps`, final loss dict as floats).
+    """
+    optimizer = build_optimizer([p for p in model.parameters() if p.requires_grad], optimizer_cfg)
+    scheduler = build_scheduler(optimizer, scheduler_cfg, steps)
+    target = target.to(device)
+    n = target.shape[0]
+    eval_at = set(eval_at)
+
+    def predict():
+        return predict_volume(model, shape, spacing_mm, 0, eval_chunk_size, device)
+
+    fit_seconds, last_pred = 0.0, None
+    for step in range(1, steps + 1):
+        t0 = time.perf_counter()
+        optimizer.zero_grad(set_to_none=True)
+        idx = (torch.arange(n, device=device) if points_per_step is None
+               else torch.randint(n, (points_per_step,), device=device))
+        coords = coords_from_indices(idx, shape, spacing_mm).requires_grad_(True)
+        loss = loss_fn(model.forward(coords), coords, target[idx])
+        loss["total"].backward()
+        optimizer.step()
+        scheduler.step()
+        if torch.device(device).type == "cuda":
+            torch.cuda.synchronize(device)
+        fit_seconds += time.perf_counter() - t0
+        if log and (step % max(steps // 10, 1) == 0 or step in (1, steps)):
+            print(f"  step {step:>5}: " + " ".join(f"{k}={v.item():.5f}" for k, v in loss.items()))
+        if step in eval_at and on_eval is not None:
+            last_pred = predict()
+            on_eval(step, last_pred, fit_seconds)
+
+    final = {key: float(v.detach()) for key, v in loss.items()}
+    return (last_pred if steps in eval_at and last_pred is not None else predict()), final
 
 
 def train_encoder_jointly(

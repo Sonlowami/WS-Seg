@@ -51,7 +51,6 @@ fraction below zero, oracle-threshold Dice) are always printed.
 import argparse
 import re
 import time
-import warnings
 from pathlib import Path
 
 import nibabel as nib
@@ -63,6 +62,7 @@ from utils.metrics import per_label_metrics
 from data.dataset import build_dataset
 from data.msd import load_tasks, resolve_label_groups
 from sdf.targets import create_mask_sdf_with_clipping, build_channel_masks, sdf_to_channel_masks
+from models.interfaces import merge_model_config
 from training.train_loop import resolve_device
 from training.sdf_fit import (
     as_affine, to_original_grid, group_names, group_label_values, masks_to_label_map, oracle_dice,
@@ -82,17 +82,9 @@ def resolve_config(args) -> tuple:
         encoder_state_dict = ckpt["encoder_state_dict"]
     cfg = load_config(args.config) if args.config else ckpt["config"]
     if args.encoder_ckpt and args.config:
-        # Encoder weights only fit the encoder they were trained with, but the
-        # decoder is always freshly initialized, so its depth may come from
-        # --config (e.g. a non-linear decoder on a frozen prior).
-        ckpt_model, cfg_model = ckpt["config"]["model"], cfg["model"]
-        encoder_keys = [k for k in ckpt_model if k != "decoder_layers"]
-        differing = [k for k in encoder_keys if cfg_model.get(k, ckpt_model[k]) != ckpt_model[k]]
-        if differing:
-            warnings.warn(f"--config model keys {differing} differ from the checkpoint's; "
-                          f"using the checkpoint's values (they define the encoder).")
-        cfg["model"] = {**ckpt_model,
-                        "decoder_layers": cfg_model.get("decoder_layers", ckpt_model["decoder_layers"])}
+        # Decoder depth may come from --config (e.g. a non-linear decoder on a
+        # frozen prior); the encoder's shape always comes from its checkpoint.
+        cfg["model"] = merge_model_config(ckpt["config"]["model"], cfg.get("model"))
     if "sdf" not in cfg:
         raise SystemExit("Config has no sdf: block (alpha, eikonal_lambda, label_groups); "
                          "pass --config with one.")

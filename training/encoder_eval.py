@@ -12,7 +12,6 @@ from data.dataset import build_dataset
 from data.msd import load_tasks, resolve_label_groups_per_task
 from training.sdf_fit import prepare_sdf_case, fit_sdf, evaluate_sdf_fit, group_names
 
-
 def load_case_refs(data_cfg: dict, label_spec, split: str, max_cases: int = None) -> list:
     """
     Lightweight references to evaluation cases, sorted by case_id:

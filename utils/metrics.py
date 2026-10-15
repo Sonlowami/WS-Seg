@@ -28,6 +28,14 @@ def ssim_3d(pred: np.ndarray, target: np.ndarray, data_range: float = None,
         data_range = target.max() - target.min()
     return float(sk_ssim(pred, target, data_range=data_range, channel_axis=channel_axis))
 
+def metric_fn(pred, target, shape, channels):
+    full_shape = (*shape, channels)
+    pred_vol = pred.reshape(full_shape).cpu().numpy()
+    target_vol = target.reshape(full_shape).cpu().numpy()
+    return {
+        "psnr": psnr_3d(pred_vol, target_vol),
+        "ssim": ssim_3d(pred_vol, target_vol, channel_axis=-1),
+    }
 
 def dice_score(pred_mask: np.ndarray, gt_mask: np.ndarray, eps: float = 1e-6) -> float:
     pred_mask = pred_mask.astype(bool)
