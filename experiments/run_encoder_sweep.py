@@ -44,11 +44,12 @@ from training.train_loop import resolve_device
 from training.sdf_fit import case_seed
 from training.encoder_eval import load_case_refs, prepare_ref, score_encoder, format_progress
 
-CONFIG_FIELDS = ["config", "hidden_dim", "encoder_layers", "decoder_layers", "encoder_params"]
+CONFIG_FIELDS = ["config", "hidden_dim", "encoder_layers", "decoder_layers", "decoder_hidden_dim",
+                 "encoder_params"]
 FIELDS = CONFIG_FIELDS + ["arm", "protocol", "case_id", "task", "steps", "fit_seconds", "psnr",
                           "label", "gt_voxels", "dice", "nsd", "oracle_dice", "native_dice",
                           "native_nsd"]
-INT_FIELDS = ("hidden_dim", "encoder_layers", "decoder_layers", "encoder_params", "steps",
+INT_FIELDS = ("hidden_dim", "encoder_layers", "decoder_layers", "decoder_hidden_dim", "encoder_params", "steps",
               "gt_voxels")
 FLOAT_FIELDS = ("fit_seconds", "psnr", "dice", "nsd", "oracle_dice", "native_dice", "native_nsd")
 
@@ -96,8 +97,8 @@ def train_or_load(tag: str, cfg: dict, ckpt_dir: Path, resume: bool, sweep: str)
 
 def report(rows: list, points: dict, out: str):
     """Write the two summary CSVs and print the headline table."""
-    by = ("config", "hidden_dim", "encoder_layers", "decoder_layers", "encoder_params",
-          "arm", "protocol", "steps")
+    by = ("config", "hidden_dim", "encoder_layers", "decoder_layers", "decoder_hidden_dim",
+          "encoder_params", "arm", "protocol", "steps")
     summary = aggregate_cases(rows, by)
     for r in summary:
         r["train_seconds"] = points.get(r["config"], {}).get("train_seconds", float("nan")) \
@@ -199,7 +200,9 @@ def main():
             model = point["cfg"]["model"]
             meta = {"config": tag, "hidden_dim": model["hidden_dim"],
                     "encoder_layers": model["encoder_layers"],
-                    "decoder_layers": model["decoder_layers"], "encoder_params": point["params"],
+                    "decoder_layers": model["decoder_layers"],
+                    "decoder_hidden_dim": model.get("decoder_hidden_dim") or model["hidden_dim"],
+                    "encoder_params": point["params"],
                     "arm": arm, "protocol": protocol}
             rows = score_encoder(
                 point["cfg"], sdf_case, point["state_dict"] if arm == "trained" else None,

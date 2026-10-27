@@ -55,7 +55,10 @@ def build_model(model_cfg: dict, out_features: int, num_decoders: int = 1) -> En
     model_cfg keys:
         encoder_layers  shared layers kept across images
         decoder_layers  per-image layers, re-initialized for each case
-        hidden_dim      width of every hidden layer
+        hidden_dim      width of every encoder layer (and of the decoder by default)
+        decoder_hidden_dim  optional, width of the decoder's hidden layers; lower
+                        it for a smaller per-image decoder. No effect with
+                        decoder_layers: 1, whose only layer is the output layer.
         omega           optional SIREN frequency, default 30.0
     Inputs are always 3-D coordinates; out_features is the target width
     (image channels for Encoder I, label groups for Encoder II).
@@ -72,7 +75,12 @@ def build_model(model_cfg: dict, out_features: int, num_decoders: int = 1) -> En
             f"Need at least one encoder and one decoder layer, got "
             f"encoder_layers={encoder_layers}, decoder_layers={decoder_layers}"
         )
+    decoder_hidden_dim = model_cfg.get("decoder_hidden_dim") or model_cfg["hidden_dim"]
+    if decoder_hidden_dim != model_cfg["hidden_dim"] and decoder_layers == 1:
+        warnings.warn("decoder_hidden_dim has no effect with decoder_layers: 1 (the decoder is a "
+                      "single output layer); use decoder_layers >= 2 for a narrower decoder.")
     return STRAINER_INR(
+        decoder_hidden_features=decoder_hidden_dim,
         in_features=3,
         hidden_features=model_cfg["hidden_dim"],
         hidden_layers=encoder_layers + decoder_layers,
@@ -83,22 +91,30 @@ def build_model(model_cfg: dict, out_features: int, num_decoders: int = 1) -> En
     )
 
 
+# Model keys that shape only the decoder, which is always built fresh; every
+# other model key shapes the encoder and must match its checkpoint.
+DECODER_KEYS = ("decoder_layers", "decoder_hidden_dim")
+
+
 def merge_model_config(encoder_model_cfg: dict, cfg_model: dict = None) -> dict:
     """
     Architecture for fitting a fresh decoder on a saved encoder: every key
     that shapes the encoder comes from the encoder's checkpoint config (its
-    weights load into nothing else); decoder_layers may come from cfg_model,
-    since the decoder is always newly built. Warns if cfg_model disagrees on
-    an encoder key.
+    weights load into nothing else); DECODER_KEYS come from cfg_model when it
+    sets them, else from the checkpoint. Warns if cfg_model disagrees on an
+    encoder key.
     """
     cfg_model = cfg_model or {}
     differing = [k for k in encoder_model_cfg
-                 if k != "decoder_layers" and cfg_model.get(k, encoder_model_cfg[k]) != encoder_model_cfg[k]]
+                 if k not in DECODER_KEYS and cfg_model.get(k, encoder_model_cfg[k]) != encoder_model_cfg[k]]
     if differing:
         warnings.warn(f"config model keys {differing} differ from the encoder checkpoint's; "
                       f"using the checkpoint's values (they define the encoder).")
-    return {**encoder_model_cfg,
-            "decoder_layers": cfg_model.get("decoder_layers", encoder_model_cfg["decoder_layers"])}
+    merged = {k: v for k, v in encoder_model_cfg.items() if k not in DECODER_KEYS}
+    for key in DECODER_KEYS:
+        if key in cfg_model or key in encoder_model_cfg:
+            merged[key] = cfg_model.get(key, encoder_model_cfg.get(key))
+    return merged
 
 
 def print_model_summary(model: EncoderDecoderINR, n_points: int = 4096,

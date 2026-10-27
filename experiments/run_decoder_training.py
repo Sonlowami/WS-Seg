@@ -21,7 +21,12 @@ Settings come from the config's dec_training block (all optional):
   optimizer, scheduler, points_per_step
                    default to the config's optimizer / scheduler / training
 The encoder's architecture always comes from its checkpoint; the decoder's
-depth (model.decoder_layers) may come from --config.
+depth and width (model.decoder_layers, model.decoder_hidden_dim -- default the
+encoder's hidden_dim, can be lower for a smaller decoder) come from --config
+or --decoder_layers / --decoder_hidden_dim. Each decoder size gets its own
+default --out_dir (<encoder_ckpt>_decoders_d<width>_L<depth>) and wandb run;
+WandB gets every image's metrics plus the decoder size, mean/median PSNR and
+SSIM, and a table of all images.
 
 Usage:
   python -m experiments.run_decoder_training --config config/encoder_I_intensity.yaml \\
@@ -31,6 +36,7 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -54,6 +60,32 @@ FIELDS = ["case_id", "task", "modality", "decoder_file", "steps", "fit_seconds",
 def _first(x):
     """DataLoader (batch_size=1) wraps string fields in a list."""
     return x[0] if isinstance(x, (list, tuple)) else x
+
+
+def decoder_size(model_cfg: dict) -> tuple:
+    """(hidden width, depth) of the decoder a model config builds."""
+    return model_cfg.get("decoder_hidden_dim") or model_cfg["hidden_dim"], model_cfg["decoder_layers"]
+
+
+def log_summary(wandb_run, manifest: Path, decoder_info: dict):
+    """Mean/median PSNR and SSIM over every image in decoders.csv (including
+    ones from earlier --resume runs), printed and sent to wandb."""
+    rows = read_rows([manifest], float_fields=("psnr", "ssim", "loss", "fit_seconds"),
+                     fieldnames=FIELDS)
+    if not rows:
+        return
+    summary = {"n_images": len(rows), **decoder_info}
+    for metric in ("psnr", "ssim"):
+        values = [r[metric] for r in rows]
+        summary[f"mean_{metric}"] = float(np.nanmean(values))
+        summary[f"median_{metric}"] = float(np.nanmedian(values))
+    print("\nsummary: " + ", ".join(f"{k}={v:.4f}" if isinstance(v, float) else f"{k}={v}"
+                                    for k, v in summary.items()))
+    if wandb_run is not None:
+        import wandb
+        wandb_run.summary.update(summary)
+        wandb_run.log({"decoders": wandb.Table(columns=FIELDS,
+                                               data=[[r[c] for c in FIELDS] for r in rows])})
 
 
 def train_decoders(cfg: dict, encoder_state_dict: dict, out_dir, wandb_kwargs: dict = None,
@@ -97,12 +129,16 @@ def train_decoders(cfg: dict, encoder_state_dict: dict, out_dir, wandb_kwargs: d
     template = build_model(cfg["model"], out_features=channels)
     template.load_encoder_state_dict(encoder_state_dict, freeze=True)
     print_model_summary(template, title=f"STRAINER for decoder training (out_features={channels})")
+    width, depth = decoder_size(cfg["model"])
+    decoder_info = {"decoder_hidden_dim": width, "decoder_layers": depth,
+                    "decoder_params": sum(p.numel() for p in template.decoder_parameters())}
     del template
 
     print(f"{len(dataset)} {split} images ({len(done)} already done), {steps} steps each, "
-          f"frozen encoder, device {device}, decoders -> {out_dir}")
-    wandb_run = configure_wandb(cfg["wandb"], f"{cfg['experiment_name']}_decoders", cfg,
-                                **(wandb_kwargs or {}))
+          f"frozen encoder, decoder {width} wide x {depth} layers "
+          f"({decoder_info['decoder_params']:,} params), device {device}, decoders -> {out_dir}")
+    wandb_run = configure_wandb(cfg["wandb"], f"{cfg['experiment_name']}_decoders_d{width}_L{depth}",
+                                {**cfg, "decoder": decoder_info}, **(wandb_kwargs or {}))
     rows = []
     for n, case in enumerate(DataLoader(dataset, batch_size=1, shuffle=False), 1):
         case_id = _first(case["case_id"])
@@ -141,6 +177,7 @@ def train_decoders(cfg: dict, encoder_state_dict: dict, out_dir, wandb_kwargs: d
             wandb_run.log({"case_id": case_id, "psnr": row["psnr"], "ssim": row["ssim"],
                            "loss": row["loss"], "fit_seconds": row["fit_seconds"]})
 
+    log_summary(wandb_run, manifest, decoder_info)
     if wandb_run is not None:
         wandb_run.finish()
     return rows
@@ -151,7 +188,11 @@ def main():
     parser.add_argument("--config", required=True, help="Data, dec_training, optimizer, wandb settings")
     parser.add_argument("--encoder_ckpt", required=True, help="Checkpoint dir (encoder.pt + config.json)")
     parser.add_argument("--out_dir", default=None,
-                        help="Default: <encoder_ckpt>_decoders next to the checkpoint")
+                        help="Default: <encoder_ckpt>_decoders_d<width>_L<depth> next to the checkpoint")
+    parser.add_argument("--decoder_hidden_dim", type=int, default=None,
+                        help="Override model.decoder_hidden_dim (default: the encoder's hidden_dim)")
+    parser.add_argument("--decoder_layers", type=int, default=None,
+                        help="Override model.decoder_layers")
     parser.add_argument("--split", default=None, help="Override dec_training.split")
     parser.add_argument("--steps", type=int, default=None, help="Override dec_training.steps")
     parser.add_argument("--data_root", default=None)
@@ -164,16 +205,29 @@ def main():
     if args.data_root:
         cfg["data"]["root"] = args.data_root
     ckpt = load_model_weights(args.encoder_ckpt)
-    cfg["model"] = merge_model_config(ckpt["config"]["model"], cfg.get("model"))
+    cfg_model = dict(cfg.get("model") or {})
+    for key in ("decoder_hidden_dim", "decoder_layers"):
+        if getattr(args, key) is not None:
+            cfg_model[key] = getattr(args, key)
+    cfg["model"] = merge_model_config(ckpt["config"]["model"], cfg_model)
     cfg["dec_training"] = dict(cfg.get("dec_training") or {})
     for key in ("split", "steps"):
         if getattr(args, key) is not None:
             cfg["dec_training"][key] = getattr(args, key)
 
     ckpt_dir = Path(args.encoder_ckpt)
-    out_dir = Path(args.out_dir) if args.out_dir else ckpt_dir.with_name(f"{ckpt_dir.name}_decoders")
+    width, depth = decoder_size(cfg["model"])
+    out_dir = Path(args.out_dir) if args.out_dir else \
+        ckpt_dir.with_name(f"{ckpt_dir.name}_decoders_d{width}_L{depth}")
+    saved = out_dir / "config.json"
+    if args.resume and saved.exists():
+        previous = json.loads(saved.read_text())
+        if previous.get("model") != cfg["model"] or previous.get("encoder_ckpt") != str(ckpt_dir):
+            raise SystemExit(f"{out_dir} holds decoders for encoder {previous.get('encoder_ckpt')} "
+                             f"with model {previous.get('model')}, not {ckpt_dir} with {cfg['model']}; "
+                             f"resuming would mix decoders. Choose another --out_dir.")
     out_dir.mkdir(parents=True, exist_ok=True)
-    with open(out_dir / "config.json", "w") as f:
+    with open(saved, "w") as f:
         json.dump({"encoder_ckpt": str(ckpt_dir), **cfg}, f, indent=2)
     train_decoders(cfg, ckpt["encoder_state_dict"], out_dir, resume=args.resume, seed=args.seed)
 

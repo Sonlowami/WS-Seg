@@ -66,6 +66,7 @@ from utils.io import load_model_weights
 from utils.logging_utils import configure_wandb
 from utils.results_io import RowWriter, read_rows as _read_rows, write_csv
 from utils.stats import ARMS, shard, summarize
+from models.interfaces import DECODER_KEYS
 from training.train_loop import resolve_device
 from training.sdf_fit import case_seed
 from training.encoder_eval import load_case_refs, prepare_ref, score_encoder, format_progress
@@ -84,7 +85,7 @@ def read_rows(paths: list) -> list:
 # ---------------------------------------------------------------- config
 
 def _encoder_keys(model_cfg: dict) -> dict:
-    return {k: v for k, v in model_cfg.items() if k != "decoder_layers"}
+    return {k: v for k, v in model_cfg.items() if k not in DECODER_KEYS}
 
 
 def resolve_fit_config(ckpt_I: dict, ckpt_II: dict, config_path: str, data_root: str) -> dict:
@@ -106,9 +107,10 @@ def resolve_fit_config(ckpt_I: dict, ckpt_II: dict, config_path: str, data_root:
         for block in ("sdf", "optimizer", "scheduler", "training"):
             if block in override:
                 cfg[block] = override[block]
-        # The decoder is always fresh, so its depth may differ from training.
-        if "decoder_layers" in override.get("model", {}):
-            cfg["model"]["decoder_layers"] = override["model"]["decoder_layers"]
+        # The decoder is always fresh, so its depth and width may differ from training.
+        for key in DECODER_KEYS:
+            if key in override.get("model", {}):
+                cfg["model"][key] = override["model"][key]
     if data_root:
         cfg["data"]["root"] = data_root
     return cfg
@@ -295,7 +297,7 @@ def main():
     parser.add_argument("--encoder_II_ckpt")
     parser.add_argument("--config", default=None,
                         help="Override fit settings (sdf/optimizer/scheduler/training blocks, "
-                             "model.decoder_layers); default: Encoder II's checkpoint config")
+                             "model.decoder_layers / decoder_hidden_dim); default: Encoder II's checkpoint config")
     parser.add_argument("--data_root", default=None, help="Override data.root of the trained tasks")
     parser.add_argument("--split", default="test", choices=["train", "val", "test"])
     parser.add_argument("--skip_internal", action="store_true", help="Only evaluate external tasks")

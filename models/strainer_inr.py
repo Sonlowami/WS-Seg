@@ -1,9 +1,41 @@
 import torch
 import torch.nn as nn
 from .interfaces import EncoderDecoderINR
+from alpine.models.nonlin import Sine
 from alpine.models.strainer import Strainer, get_linear_layer
 
 class STRAINER_INR(Strainer, EncoderDecoderINR):
+    def __init__(self, *args, decoder_hidden_features: int = None, **kwargs):
+        """
+        Alpine's Strainer with an optional separate decoder width. Alpine gives
+        every layer hidden_features; with decoder_hidden_features the heads
+        are rebuilt as encoder width -> decoder width -> ... -> out_features,
+        with Alpine's own SIREN init and the same omegas. Left at None (or
+        equal to hidden_features) the model is exactly Alpine's.
+        """
+        super().__init__(*args, **kwargs)
+        width = kwargs["hidden_features"]
+        if decoder_hidden_features and decoder_hidden_features != width:
+            self.decoder = self._build_heads(width, decoder_hidden_features, kwargs["out_features"],
+                                             kwargs["num_decoders"], kwargs.get("bias", True))
+
+    def _build_heads(self, in_width: int, width: int, out_features: int, num_heads: int,
+                     bias: bool) -> nn.ModuleList:
+        n = self.num_decoder_layers
+        omegas = self.omegas[len(self.omegas) - n:]
+        heads = nn.ModuleList()
+        for _ in range(num_heads):
+            layers = []
+            for j in range(n):
+                last = j == n - 1
+                layers.append(get_linear_layer(in_width if j == 0 else width,
+                                               out_features if last else width,
+                                               omega=omegas[j], bias=bias, is_last=last))
+                if not last:
+                    layers.append(Sine(omega=omegas[j]))
+            heads.append(nn.ModuleList(layers))
+        return heads
+
     def forward(self, coords, decoder_index: int = 0):
         """Shared encoder, then one decoder head. Alpine's own forward runs
         every head on every point, which jointly training N heads on N
