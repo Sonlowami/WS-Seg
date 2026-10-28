@@ -64,9 +64,9 @@ def split_cases(case_ids: list, test_fraction: float, seed: int) -> dict:
 def load_sdf_targets(data_cfg: dict, label_spec, case_ids: set, native_ids: set,
                      spacing_mm: tuple, alpha: float) -> dict:
     """
-    {case_id: {"case_id", "target": (N, K) float16 CPU tensor, "band": its
-    near-boundary voxel indices (for stratified sampling), "shape",
-    "mm_per_unit", "sdf_case"}} for every case in case_ids. sdf_case
+    {case_id: {"case_id", "task", "names" (label groups), "target": (N, K)
+    float16 CPU tensor, "shape", "mm_per_unit", "sdf_case"}} for every case
+    in case_ids; K may differ between tasks. sdf_case
     (training/sdf_fit.prepare_sdf_case, for evaluation) is kept only for
     native_ids, with native-grid data; None for the others.
     """
@@ -75,23 +75,39 @@ def load_sdf_targets(data_cfg: dict, label_spec, case_ids: set, native_ids: set,
     if missing:
         raise SystemExit(f"{len(missing)} decoder cases not found in the data, e.g. {missing[:3]}; "
                          f"is --data_root the folder the decoders were trained from?")
-    counts = {task: len(groups) for task, groups in refs[0][3].items()
-              if any(r[1].data[r[2]]["task"] == task for r in refs)}
-    if len(set(counts.values())) > 1:
-        raise SystemExit(f"Tasks resolve to different label-group counts {counts}, but one hypernet "
-                         f"predicts one decoder size; use an sdf.label_groups spec such as "
-                         f'[["foreground"]] that gives every task the same count.')
     targets = {}
     for n, ref in enumerate(refs, 1):
         sdf_case = prepare_ref(ref, spacing_mm, alpha, native=ref[0] in native_ids)
         k = sdf_case["sdf"].shape[-1]
-        target = torch.from_numpy(sdf_case["sdf"]).reshape(-1, k)
         targets[ref[0]] = {
-            "case_id": ref[0], "shape": sdf_case["shape"], "target": target.half(),
-            "band": band_indices(target, alpha),
+            "case_id": ref[0], "task": sdf_case["task"], "names": sdf_case["names"],
+            "shape": sdf_case["shape"],
+            "target": torch.from_numpy(sdf_case["sdf"]).reshape(-1, k).half(),
             "mm_per_unit": mm_per_unit(sdf_case["shape"], spacing_mm),
             "sdf_case": sdf_case if ref[0] in native_ids else None,
         }
-        print(f"  loaded SDF {n}/{len(refs)} {ref[0]} grid {sdf_case['shape']} x {k} groups, "
-              f"{len(targets[ref[0]]['band']) / len(target):.1%} of voxels in the band")
+        print(f"  loaded SDF {n}/{len(refs)} {ref[0]} grid {sdf_case['shape']} x {k} groups")
     return targets
+
+
+def label_targets(case: dict, per_label: bool, alpha: float) -> list:
+    """
+    The decoder targets of one case (from load_sdf_targets): with per_label
+    one 1-channel target per label group, keyed "<task>/<group>", so tasks
+    with different label sets share one decoder size (the output-side
+    counterpart of data.per_modality); otherwise one target of all K groups,
+    keyed "all". Each is {**case, "label", "channels" (a slice of the K),
+    "target" (a view), "band" (its near-boundary voxels, for stratified
+    sampling)}.
+    """
+    k = case["target"].shape[1]
+    if per_label:
+        parts = [(f"{case['task']}/{name}", slice(j, j + 1)) for j, name in enumerate(case["names"])]
+    else:
+        parts = [("all", slice(0, k))]
+    out = []
+    for label, channels in parts:
+        target = case["target"][:, channels]
+        out.append({**case, "label": label, "channels": channels, "target": target,
+                    "band": band_indices(target, alpha)})
+    return out

@@ -35,9 +35,16 @@ class HeadLayout:
         """Each element gets the std of its own tensor in `head` (typically a
         freshly initialized one): the natural step size per tensor, since
         SIREN's first, hidden and last layers and the biases differ in scale
-        by orders of magnitude."""
-        return torch.cat([torch.full((n,), float(p.detach().std().clamp(min=1e-6)))
-                          for p, n in zip(head.parameters(), self.sizes)])
+        by orders of magnitude. Biases get the std of PyTorch's default bias
+        init, 1/sqrt(3 * fan_in), instead: a 1-channel output bias is a single
+        number, whose sample std is NaN."""
+        stds = []
+        for layer in head:
+            if isinstance(layer, nn.Linear):
+                stds.append(float(layer.weight.detach().std().clamp(min=1e-6)))
+                if layer.bias is not None:
+                    stds.append((3 * layer.in_features) ** -0.5)
+        return torch.cat([torch.full((n,), s) for s, n in zip(stds, self.sizes)])
 
 
 def encode(model, coords: torch.Tensor) -> torch.Tensor:
@@ -69,22 +76,27 @@ def load_head(head: nn.Module, params: list):
 
 class HyperMLP(nn.Module):
     """
-    in_dim -> hidden_dim -> ... -> out_dim, `layers` Linear layers in total.
+    (in_dim + n_labels) -> hidden_dim -> ... -> out_dim, `layers` Linear
+    layers in total. The input is the intensity decoder's vector,
+    standardized per coordinate with the training set's mean and std, joined
+    with a one-hot of the label group to predict (sdf.per_label; a single
+    label otherwise).
 
-    Inputs are standardized per coordinate with the training set's mean and
-    std. The output is a residual in units of each tensor's own scale:
-    weights = base + scale * mlp(x), where base is a reference SDF decoder
-    (the floor, or a fresh SIREN init) and scale the per-tensor std
-    (HeadLayout.tensor_stds). The last layer starts at zero, so training
-    starts exactly at base. All four are buffers, saved with the state_dict.
+    The output is a residual in units of each tensor's own scale:
+    weights = base[label] + scale * mlp(x), where base[label] is a reference
+    SDF decoder for that label (its floor, or a fresh SIREN init) and scale
+    the per-tensor std (HeadLayout.tensor_stds). The last layer starts at
+    zero, so training starts exactly at base. These references are buffers,
+    saved with the state_dict.
     """
 
-    def __init__(self, in_dim: int, out_dim: int, hidden_dim: int = 1024, layers: int = 4,
-                 activation: str = "gelu"):
+    def __init__(self, in_dim: int, out_dim: int, n_labels: int = 1, hidden_dim: int = 1024,
+                 layers: int = 4, activation: str = "gelu"):
         super().__init__()
         if layers < 2:
             raise ValueError(f"hypernet.layers must be >= 2, got {layers}")
-        dims = [in_dim] + [hidden_dim] * (layers - 1) + [out_dim]
+        self.n_labels = n_labels
+        dims = [in_dim + n_labels] + [hidden_dim] * (layers - 1) + [out_dim]
         blocks = []
         for i in range(layers):
             blocks.append(nn.Linear(dims[i], dims[i + 1]))
@@ -93,15 +105,21 @@ class HyperMLP(nn.Module):
         self.mlp = nn.Sequential(*blocks)
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
-        for name, size in (("in_mean", in_dim), ("in_std", in_dim), ("base", out_dim), ("scale", out_dim)):
-            self.register_buffer(name, torch.zeros(size) if name in ("in_mean", "base") else torch.ones(size))
+        self.register_buffer("in_mean", torch.zeros(in_dim))
+        self.register_buffer("in_std", torch.ones(in_dim))
+        self.register_buffer("base", torch.zeros(n_labels, out_dim))
+        self.register_buffer("scale", torch.ones(out_dim))
 
     def set_reference(self, inputs: torch.Tensor, base: torch.Tensor, scale: torch.Tensor):
-        """inputs: (n_train, in_dim) training vectors, for the standardization."""
+        """inputs: (n_train, in_dim) training vectors, for the standardization;
+        base: (n_labels, out_dim), one reference decoder per label."""
         self.in_mean.copy_(inputs.mean(0))
         self.in_std.copy_(inputs.std(0).clamp(min=1e-6) if len(inputs) > 1 else torch.ones_like(self.in_std))
         self.base.copy_(base)
         self.scale.copy_(scale)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.base + self.scale * self.mlp((x - self.in_mean) / self.in_std)
+    def forward(self, x: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
+        """x: (B, in_dim); label: (B,) label indices."""
+        onehot = F.one_hot(label, self.n_labels).to(x.dtype)
+        h = torch.cat([(x - self.in_mean) / self.in_std, onehot], dim=-1)
+        return self.base[label] + self.scale * self.mlp(h)

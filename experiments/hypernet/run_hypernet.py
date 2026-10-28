@@ -8,12 +8,20 @@ trained through the decoder's output with the masked MSE + Eikonal SDF loss,
 so it never needs target weights, only each case's clipped mask SDF. The
 predicted decoder is thresholded for Dice and NSD as in visualize_sdf_fit.
 
+Labels: with sdf.per_label (the output-side counterpart of
+data.per_modality) every label group of a case is its own 1-channel SDF
+decoder, so tasks with different label sets (spleen; prostate PZ, TZ) share
+one decoder size; the MLP is told which label to predict by a one-hot of
+"<task>/<group>". Otherwise one decoder covers all K groups and every task
+must have the same K. For scoring, a case's per-label predictions are
+stacked back into its K channels.
+
 Methods, all scored on the same held-out test cases:
-  floor     one SDF decoder fitted to every training case at once (the
-            average shape): what a decoder knows without seeing the case
-  hypernet  the MLP's prediction from the case's intensity decoder
-  ceiling   a decoder fitted to the test case's own SDF (as in the
-            translation test, frozen encoder): the best this decoder can do
+  floor     per label, one SDF decoder fitted to every training case at once
+            (the average shape): what a decoder knows without seeing the case
+  hypernet  the MLP's prediction from the case's intensity decoder (and label)
+  ceiling   per label, a decoder fitted to the test case's own SDF (frozen
+            encoder, training/sdf_fit.fit_sdf): the best this decoder can do
 Expected: floor < hypernet < ceiling. Paired Wilcoxon tests over cases (Holm
 corrected per metric) test both gaps.
 
@@ -35,9 +43,9 @@ data settings come from the decoders folder's config.json.
 
 Outputs in --out_dir (default <decoders_dir>_hypernet):
   split.json             train/test case ids
-  floor_decoder.pt       the floor's decoder state_dict
+  floor_decoders.pt      {label: the floor's decoder state_dict}
   hypernet.pt            the MLP (with its normalization and base), sizes, config
-  predicted_decoders/    each test input's predicted SDF decoder
+  predicted_decoders/    each test input's (and label's) predicted SDF decoder
   results.csv            method x test input x label group: Dice/NSD (resampled
                          and native), PSNR, fit or prediction seconds
   summary.csv            per method: n / mean / median over cases of the
@@ -56,17 +64,17 @@ Usage:
 import argparse
 import json
 import math
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from experiments.hypernet.data import load_decoder_bank, split_cases, load_sdf_targets
+from experiments.hypernet.data import load_decoder_bank, split_cases, load_sdf_targets, label_targets
 from experiments.hypernet.model import HeadLayout, HyperMLP, flatten_state_dict
 from experiments.hypernet.train import train_weights, predict_and_score
 from models.interfaces import DECODER_KEYS, build_model
-from training.encoder_eval import score_encoder
-from training.sdf_fit import case_seed
+from training.sdf_fit import case_seed, fit_sdf, evaluate_sdf_fit
 from training.train_loop import build_optimizer, build_scheduler, resolve_device
 from utils.config import load_config
 from utils.io import load_model_weights, save_decoder_weights
@@ -101,7 +109,9 @@ def sdf_model_config(decoder_model: dict, hcfg: dict) -> dict:
 # ---------------------------------------------------------------- training
 
 def train_floor(model, layout, train_items, test_items, cfg, hcfg, spacing_mm, device, on_log):
-    """One decoder fitted to all training cases; returns its flat weights."""
+    """One fresh decoder fitted to all of train_items (every training case's
+    target for one label); returns its flat weights."""
+    model.reset_decoder()
     head = model.decoder[0]
     for p in head.parameters():
         p.requires_grad_(True)
@@ -118,9 +128,10 @@ def train_floor(model, layout, train_items, test_items, cfg, hcfg, spacing_mm, d
 
 def hypernet_params_for(hyper, layout, items, device):
     """params_for (experiments/hypernet/train.train_weights) of the hypernet:
-    a batched MLP forward on the chosen items' input vectors."""
+    a batched MLP forward on the chosen items' input vectors and labels."""
     inputs = torch.stack([i["x"] for i in items]).to(device)
-    return lambda chosen: [layout.unflatten(v) for v in hyper(inputs[chosen])]
+    labels = torch.tensor([i["label_index"] for i in items], device=device)
+    return lambda chosen: [layout.unflatten(v) for v in hyper(inputs[chosen], labels[chosen])]
 
 
 def train_hypernet(hyper, model, layout, train_items, test_items, cfg, hcfg, spacing_mm, device,
@@ -246,8 +257,9 @@ def main():
     # Split by case and refuse to resume into a different experiment.
     split = split_cases([i["case_id"] for i in inputs], hcfg["test_fraction"], hcfg["split_seed"])
     out_dir = Path(args.out_dir or f"{decoders_dir}_hypernet")
-    setup = {"decoders_dir": str(decoders_dir), "encoder_ckpt": dec_config["encoder_ckpt"], "sdf_model": sdf_model, "sdf": cfg["sdf"],
-             "hypernet": hcfg, "split": split, "seed": args.seed}
+    setup = {"decoders_dir": str(decoders_dir), "encoder_ckpt": dec_config["encoder_ckpt"],
+             "sdf_model": sdf_model, "sdf": cfg["sdf"], "hypernet": hcfg, "split": split,
+             "seed": args.seed}
     saved = out_dir / "config.json"
     if args.resume and saved.exists() and json.loads(saved.read_text()) != json.loads(json.dumps(setup)):
         raise SystemExit(f"{saved} was written with different settings; resuming would mix "
@@ -259,16 +271,39 @@ def main():
     test_ids = set(split["test"])
     print(f"{len(inputs)} decoders from {len(split['train']) + len(split['test'])} cases: "
           f"{len(split['train'])} train / {len(split['test'])} test cases; loading SDFs")
+    alpha, per_label = cfg["sdf"]["alpha"], cfg["sdf"].get("per_label", False)
     targets = load_sdf_targets(data_cfg, cfg["sdf"]["label_groups"], {i["case_id"] for i in inputs},
-                               test_ids, spacing_mm, cfg["sdf"]["alpha"])
-    k = next(iter(targets.values()))["target"].shape[-1]
-    train_inputs = [{**targets[i["case_id"]], **i} for i in inputs if i["case_id"] not in test_ids]
-    test_inputs = [{**targets[i["case_id"]], **i} for i in inputs if i["case_id"] in test_ids]
-    train_cases = [targets[c] for c in split["train"]]
+                               test_ids, spacing_mm, alpha)
+    # Decoder targets per case: one per label group with sdf.per_label, else
+    # one of all groups (then every task needs the same group count).
+    parts = {c: label_targets(t, per_label, alpha) for c, t in targets.items()}
+    widths = {t["task"]: parts[c][0]["target"].shape[1] for c, t in targets.items()}
+    if len(set(widths.values())) > 1:
+        raise SystemExit(f"Tasks resolve to different label-group counts {widths}, but one hypernet "
+                         f"predicts one decoder size; set sdf.per_label: true (one 1-channel decoder "
+                         f"per label group) or use an sdf.label_groups spec that gives every task "
+                         f"the same count.")
+    k = next(iter(widths.values()))
+    labels = sorted({p["label"] for c in split["train"] for p in parts[c]})
+    unseen = sorted({p["label"] for c in split["test"] for p in parts[c]} - set(labels))
+    if unseen:
+        raise SystemExit(f"Test labels {unseen} have no training case; change hypernet.split_seed "
+                         f"or test_fraction.")
+    label_index = {label: j for j, label in enumerate(labels)}
+
+    def label_parts(case_ids, label=None):
+        return [p for c in sorted(case_ids) for p in parts[c] if label in (None, p["label"])]
+
+    def input_items(case_ids):
+        """Hypernet items: one per (intensity decoder, label part)."""
+        return [{**p, **i, "label_index": label_index[p["label"]]}
+                for i in inputs if i["case_id"] in case_ids for p in parts[i["case_id"]]]
+
+    train_items, test_items = input_items(set(split["train"])), input_items(test_ids)
     test_cases = [targets[c] for c in split["test"]]
 
     # The SDF model: frozen encoder, one decoder head whose weights are
-    # swapped per case. Its fresh init sets the hypernet's per-tensor scale.
+    # swapped per case and label. Its fresh init sets the hypernet's per-tensor scale.
     torch.manual_seed(args.seed)
     model = build_model(sdf_model, out_features=k).to(device)
     model.load_encoder_state_dict(encoder, freeze=True)
@@ -280,9 +315,11 @@ def main():
     fresh, scale = layout.flatten(head), layout.tensor_stds(head)
     in_dim = inputs[0]["x"].numel()
     sizes = {"input_size": in_dim, "output_size": layout.numel, "sdf_decoder": sdf_model,
-             "label_groups": k, "n_train_inputs": len(train_inputs), "n_test_inputs": len(test_inputs)}
-    print(f"hypernet: {in_dim:,} intensity-decoder weights -> {layout.numel:,} SDF-decoder weights "
-          f"({k} label groups) on {dec_config['encoder_ckpt']}; device {device}")
+             "out_features": k, "per_label": per_label, "labels": labels,
+             "n_train_items": len(train_items), "n_test_items": len(test_items)}
+    print(f"hypernet: {in_dim:,} intensity-decoder weights + label -> {layout.numel:,} SDF-decoder "
+          f"weights ({k} channel{'s' * (k > 1)}) on {dec_config['encoder_ckpt']}; labels {labels}; "
+          f"{len(train_items)} train / {len(test_items)} test items; device {device}")
 
     wandb_run = configure_wandb(cfg["wandb"], f"{cfg['experiment_name']}_hypernet",
                                 {**setup, "sizes": sizes})
@@ -293,24 +330,31 @@ def main():
     def on_log(prefix):
         def log(step, values):
             if wandb_run is not None:
-                wandb_run.log({f"{prefix}/step": step, **{f"{prefix}/{k}": v for k, v in values.items()}})
+                wandb_run.log({f"{prefix.split('/')[0]}/step": step,
+                               **{f"{prefix}/{k}": v for k, v in values.items()}})
         return log
 
-    # Floor.
-    floor_path = out_dir / "floor_decoder.pt"
+    # Floor: one decoder per label, fitted to all training cases.
+    floor_path = out_dir / "floor_decoders.pt"
     if args.resume and floor_path.exists():
-        floor = flatten_state_dict(torch.load(floor_path, map_location="cpu")).to(device)
+        floors = {label: flatten_state_dict(sd).to(device)
+                  for label, sd in torch.load(floor_path, map_location="cpu").items()}
         print(f"floor: reusing {floor_path}")
     else:
-        print("floor: one decoder fitted to all training cases")
-        torch.manual_seed(args.seed)
-        floor = train_floor(model, layout, train_cases, test_cases, cfg, hcfg, spacing_mm, device,
-                            on_log("floor"))
-        torch.save(model.decoder_state_dict(), floor_path)
+        floors, saved_floors = {}, {}
+        for label in labels:
+            print(f"floor {label}: one decoder fitted to all training cases")
+            torch.manual_seed(args.seed)
+            floors[label] = train_floor(model, layout, label_parts(split["train"], label),
+                                        label_parts(test_ids, label), cfg, hcfg, spacing_mm, device,
+                                        on_log(f"floor/{label}" if per_label else "floor"))
+            saved_floors[label] = {n: v.detach().cpu().clone() for n, v in model.decoder_state_dict().items()}
+        torch.save(saved_floors, floor_path)
 
     # Hypernet.
     hyper_path = out_dir / "hypernet.pt"
-    hyper = HyperMLP(in_dim, layout.numel, hcfg["hidden_dim"], hcfg["layers"], hcfg["activation"]).to(device)
+    hyper = HyperMLP(in_dim, layout.numel, len(labels), hcfg["hidden_dim"], hcfg["layers"],
+                     hcfg["activation"]).to(device)
     if args.resume and hyper_path.exists():
         hyper.load_state_dict(torch.load(hyper_path, map_location=device)["state_dict"])
         hyper.eval()
@@ -320,57 +364,71 @@ def main():
         print(f"hypernet: {hcfg['layers']}-layer MLP, {hcfg['hidden_dim']} wide, {n_params:,} params, "
               f"starting from the {'floor' if hcfg['init_from_floor'] else 'fresh SIREN init'}")
         torch.manual_seed(args.seed)
-        hyper.set_reference(torch.stack([i["x"] for i in train_inputs]).to(device),
-                            floor if hcfg["init_from_floor"] else fresh, scale.to(device))
-        train_hypernet(hyper, model, layout, train_inputs, test_inputs, cfg, hcfg, spacing_mm, device,
+        base = (torch.stack([floors[label] for label in labels]) if hcfg["init_from_floor"]
+                else fresh.expand(len(labels), -1))
+        hyper.set_reference(torch.stack([i["x"] for i in inputs if i["case_id"] not in test_ids]).to(device),
+                            base, scale.to(device))
+        train_hypernet(hyper, model, layout, train_items, test_items, cfg, hcfg, spacing_mm, device,
                        on_log("hypernet"))
         torch.save({"state_dict": hyper.state_dict(), **sizes, "hidden_dim": hcfg["hidden_dim"],
                     "layers": hcfg["layers"], "activation": hcfg["activation"]}, hyper_path)
 
-    # Evaluate every method on the test cases.
+    # Evaluate every method on the test cases: each predicts one decoder per
+    # label part, stacked back into the case's K channels for scoring.
     results = out_dir / "results.csv"
     done = {(r["method"], r["input"] or r["case_id"])
             for r in read_rows([results], fieldnames=FIELDS)} if args.resume and results.exists() else set()
     writer = RowWriter(results, FIELDS, args.resume)
     keys = list(model.decoder_state_dict())
 
-    def record(method, item, steps, seconds, ev_rows, psnr):
+    def record(method, item, steps, seconds, ev):
         rows = [{"method": method, "case_id": item["case_id"], "input": item.get("input", ""),
-                 "task": item["sdf_case"]["task"], "modality": item.get("modality", ""), "steps": steps,
-                 "fit_seconds": round(seconds, 3), "psnr": psnr,
-                 **{f: lab[f] for f in FIELDS[8:]}} for lab in ev_rows]
+                 "task": item["task"], "modality": item.get("modality", ""), "steps": steps,
+                 "fit_seconds": round(seconds, 3), "psnr": ev["psnr"],
+                 **{f: lab[f] for f in FIELDS[8:]}} for lab in ev["labels"]]
         writer.write(rows)
-        mean = float(np.nanmean([r["native_dice"] for r in rows]))
         print(f"  {method:<9} {rows[0]['input'] or rows[0]['case_id']}: native/resampled dice " +
               " ".join(f"{r['label']}={r['native_dice']:.3f}/{r['dice']:.3f}" for r in rows))
         if wandb_run is not None:
-            wandb_run.log({"case_id": item["case_id"], f"eval/{method}/mean_native_dice": mean,
+            wandb_run.log({"case_id": item["case_id"],
+                           f"eval/{method}/mean_native_dice": float(np.nanmean([r["native_dice"] for r in rows])),
                            f"eval/{method}/mean_dice": float(np.nanmean([r["dice"] for r in rows]))})
 
     print(f"\nevaluating on {len(test_cases)} test cases")
-    floor_params = layout.unflatten(floor)
-    for item in test_cases:
-        if ("floor", item["case_id"]) not in done:
-            ev, seconds = predict_and_score(model, floor_params, item, spacing_mm, decode_mode, chunk, device)
-            record("floor", item, hcfg["floor_steps"], 0.0, ev["labels"], ev["psnr"])
+    for case in test_cases:
+        if ("floor", case["case_id"]) not in done:
+            ev, _ = predict_and_score(model, [layout.unflatten(floors[p["label"]]) for p in parts[case["case_id"]]],
+                                      case, spacing_mm, decode_mode, chunk, device)
+            record("floor", case, hcfg["floor_steps"], 0.0, ev)
     with torch.no_grad():
-        for item in test_inputs:
-            if ("hypernet", item["input"]) in done:
+        for i in inputs:
+            if i["case_id"] not in test_ids or ("hypernet", i["input"]) in done:
                 continue
-            params = layout.unflatten(hyper(item["x"].to(device)[None])[0])
-            save_decoder_weights(dict(zip(keys, (p.cpu() for p in params))), item["input"],
-                                 out_dir / "predicted_decoders")
-            ev, seconds = predict_and_score(model, params, item, spacing_mm, decode_mode, chunk, device)
-            record("hypernet", item, hcfg["steps"], seconds, ev["labels"], ev["psnr"])
+            case_parts = parts[i["case_id"]]
+            predicted = hyper(i["x"].to(device).expand(len(case_parts), -1),
+                              torch.tensor([label_index[p["label"]] for p in case_parts], device=device))
+            part_params = [layout.unflatten(v) for v in predicted]
+            for p, params in zip(case_parts, part_params):
+                name = f"{i['input']}/{p['label'].split('/', 1)[1]}" if per_label else i["input"]
+                save_decoder_weights(dict(zip(keys, (t.cpu() for t in params))), name,
+                                     out_dir / "predicted_decoders")
+            ev, seconds = predict_and_score(model, part_params, targets[i["case_id"]], spacing_mm,
+                                            decode_mode, chunk, device)
+            record("hypernet", {**targets[i["case_id"]], **i}, hcfg["steps"], seconds, ev)
     if not args.skip_ceiling:
         fit_cfg = {**cfg, "model": sdf_model}
-        for item in test_cases:
-            if ("ceiling", item["case_id"]) in done:
+        for case in test_cases:
+            if ("ceiling", case["case_id"]) in done:
                 continue
-            rows = score_encoder(fit_cfg, item["sdf_case"], encoder,
-                                 [hcfg["ceiling_steps"]], freeze_encoder=True, device=device,
-                                 seed=case_seed(args.seed, item["case_id"]))
-            record("ceiling", item, hcfg["ceiling_steps"], rows[0]["fit_seconds"], rows, rows[0]["psnr"])
+            sdf_case, preds, t0 = case["sdf_case"], [], time.perf_counter()
+            for p in parts[case["case_id"]]:
+                pred, _ = fit_sdf(fit_cfg, {**sdf_case, "sdf": sdf_case["sdf"][..., p["channels"]]},
+                                  hcfg["ceiling_steps"], encoder_state_dict=encoder, freeze_encoder=True,
+                                  device=device, seed=case_seed(args.seed, case["case_id"]))
+                preds.append(pred)
+            seconds = time.perf_counter() - t0
+            record("ceiling", case, hcfg["ceiling_steps"], seconds,
+                   evaluate_sdf_fit(np.concatenate(preds, axis=-1), sdf_case, decode_mode))
 
     report(read_rows([results], INT_FIELDS, FLOAT_FIELDS, FIELDS), out_dir, wandb_run)
     if wandb_run is not None:

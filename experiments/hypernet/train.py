@@ -82,14 +82,21 @@ def train_weights(model, items: list, params_for, optimizer, scheduler, steps: i
 
 
 @torch.no_grad()
-def predict_and_score(model, params: list, target: dict, spacing_mm: tuple, decode_mode: str,
+def predict_and_score(model, part_params: list, case: dict, spacing_mm: tuple, decode_mode: str,
                       chunk_size: int, device) -> tuple:
-    """Load params into the model's decoder, predict target's full SDF volume
-    and score it (training/sdf_fit.evaluate_sdf_fit). Returns (evaluation,
-    seconds for the prediction)."""
+    """
+    Predict case's full SDF volume with one decoder per label part
+    (data.label_targets, in channel order: K 1-channel decoders with
+    sdf.per_label, else one K-channel decoder), stack the parts back into K
+    channels and score them (training/sdf_fit.evaluate_sdf_fit). Returns
+    (evaluation, seconds for the prediction).
+    """
     t0 = time.perf_counter()
-    load_head(model.decoder[0], params)
-    k = target["target"].shape[-1]
-    pred = predict_volume(model, target["shape"], spacing_mm, 0, chunk_size, device)
+    preds = []
+    for params in part_params:
+        load_head(model.decoder[0], params)
+        preds.append(predict_volume(model, case["shape"], spacing_mm, 0, chunk_size, device))
+    pred = torch.cat(preds, dim=-1)
     seconds = time.perf_counter() - t0
-    return evaluate_sdf_fit(pred.reshape(*target["shape"], k).numpy(), target["sdf_case"], decode_mode), seconds
+    volume = pred.reshape(*case["shape"], pred.shape[-1]).numpy()
+    return evaluate_sdf_fit(volume, case["sdf_case"], decode_mode), seconds
