@@ -12,7 +12,6 @@ Two grids are scored:
              more faithful than nearest-neighbour on an already-binary mask.
 """
 import warnings
-import zlib
 
 import nibabel as nib
 import numpy as np
@@ -80,12 +79,6 @@ def oracle_dice(pred: np.ndarray, gt: np.ndarray) -> float:
 
 # ---------------------------------------------------------------- case
 
-def case_seed(base: int, case_id: str) -> int:
-    """Seed for every fit of a case: the same for all arms of the translation
-    test and for visualize_sdf_fit, stable across shards and reruns."""
-    return base + zlib.crc32(case_id.encode()) % 1_000_000
-
-
 def prepare_sdf_case(case: dict, mask_path: str, groups: list, names: list,
                      spacing_mm: tuple, alpha: float, native: bool = True) -> dict:
     """
@@ -119,7 +112,8 @@ def prepare_sdf_case(case: dict, mask_path: str, groups: list, names: list,
 
 def fit_sdf(cfg: dict, sdf_case: dict, steps: int, encoder_state_dict: dict = None,
             freeze_encoder: bool = False, device="cpu", eval_at=(), on_eval=None,
-            seed: int = None, summarize: bool = False, log: bool = False):
+            seed: int = None, summarize: bool = False, log: bool = False,
+            return_model: bool = False):
     """
     Fit a fresh decoder -- and the encoder too unless freeze_encoder -- to
     sdf_case's clipped SDF for `steps` optimizer steps.
@@ -128,11 +122,14 @@ def fit_sdf(cfg: dict, sdf_case: dict, steps: int, encoder_state_dict: dict = No
     eval_at / on_eval: after each step count in eval_at, on_eval(step,
         pred_sdf (D, H, W, K) numpy, fit_seconds) is called; fit_seconds
         excludes evaluation time. The lr schedule always spans `steps`.
-    seed: seeds the decoder init and the point sampling, so fits that differ
-        only in encoder_state_dict see identical decoders and batches.
+    seed: seeds the decoder init and the point sampling. Callers pass one
+        seed for every case, so every decoder starts from the same init (one
+        weight-space chart) and fits that differ only in encoder_state_dict
+        see identical decoders and batches.
     cfg["sdf"]["band_fraction"] (default 0, uniform): share of each batch
         drawn from the near-boundary band |sdf| < alpha (stratified_indices).
-    Returns (pred_sdf after `steps`, final loss dict as floats).
+    Returns (pred_sdf after `steps`, final loss dict as floats), plus the
+    fitted model with return_model.
     """
     if seed is not None:
         torch.manual_seed(seed)
@@ -178,7 +175,7 @@ def fit_sdf(cfg: dict, sdf_case: dict, steps: int, encoder_state_dict: dict = No
         eval_chunk_size=train_cfg.get("eval_chunk_size", 2 ** 20), device=device, eval_at=eval_at,
         on_eval=None if on_eval is None else (lambda step, p, t: on_eval(step, as_volume(p), t)),
         log=log, sample_fn=sample_fn)
-    return as_volume(pred), final
+    return (as_volume(pred), final, model) if return_model else (as_volume(pred), final)
 
 
 # ---------------------------------------------------------------- evaluation

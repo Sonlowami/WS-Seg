@@ -41,7 +41,6 @@ from utils.io import load_model_weights, save_encoder_weights
 from utils.results_io import RowWriter, read_rows, write_csv
 from utils.stats import aggregate_cases
 from training.train_loop import resolve_device
-from training.sdf_fit import case_seed
 from training.encoder_eval import load_case_refs, prepare_ref, score_encoder, format_progress
 
 CONFIG_FIELDS = ["config", "hidden_dim", "encoder_layers", "decoder_layers", "decoder_hidden_dim",
@@ -207,7 +206,7 @@ def main():
             rows = score_encoder(
                 point["cfg"], sdf_case, point["state_dict"] if arm == "trained" else None,
                 args.steps, freeze_encoder=not args.train_encoder, device=device,
-                seed=case_seed(args.seed, case_id),
+                seed=args.seed,
                 on_rows=lambda new, ev, label=f"{tag}/{arm}": print(format_progress(label, new, ev)))
             writer.write([{**meta, **r} for r in rows])
 

@@ -32,9 +32,9 @@ p-values in the run summary, and the CSV files as an artifact. Use the same
 
 Fairness: task and fit settings (alpha, eikonal_lambda, label_groups,
 decode_mode, optimizer, scheduler, points) come from ONE config -- Encoder
-II's checkpoint, or --config -- and apply to every arm. Each case uses one
-seed for all arms, so decoder initialization and point batches are identical
-and arms differ only by encoder. Fitting and scoring are the same code as
+II's checkpoint, or --config -- and apply to every arm. Every fit uses the
+same seed (--seed), so all decoders start from one initialization, point
+batches are identical across arms, and arms differ only by encoder. Fitting and scoring are the same code as
 visualize_sdf_fit (training/sdf_fit.py).
 
 Dice: per label group, on the resampled grid ("dice", what the INR fits) and
@@ -68,7 +68,6 @@ from utils.results_io import RowWriter, read_rows as _read_rows, write_csv
 from utils.stats import ARMS, shard, summarize
 from models.interfaces import DECODER_KEYS
 from training.train_loop import resolve_device
-from training.sdf_fit import case_seed
 from training.encoder_eval import load_case_refs, prepare_ref, score_encoder, format_progress
 
 FIELDS = ["group", "task", "case_id", "arm", "protocol", "schedule", "steps", "fit_seconds",
@@ -382,7 +381,7 @@ def main():
         if not todo:
             continue
         sdf_case = prepare_ref(ref, spacing_mm, alpha, native=not args.no_native)
-        seed = case_seed(args.seed, case_id)
+        seed = args.seed
         print(f"\n[{n}/{len(refs)}] {group} {case_id} grid {sdf_case['shape']}, "
               f"groups {dict(zip(sdf_case['names'], sdf_case['groups']))}")
 

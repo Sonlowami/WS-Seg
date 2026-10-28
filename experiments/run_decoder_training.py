@@ -50,7 +50,6 @@ from data.msd import load_tasks, shared_image_channels
 from experiments.run_encoder_I import target_extractor
 from models.interfaces import build_model, merge_model_config, print_model_summary
 from training.losses import image_reconstruction_loss
-from training.sdf_fit import case_seed
 from training.train_loop import fit_inr, resolve_device, DEFAULT_POINTS_PER_STEP
 
 FIELDS = ["case_id", "task", "modality", "decoder_file", "steps", "fit_seconds", "loss",
@@ -94,6 +93,9 @@ def train_decoders(cfg: dict, encoder_state_dict: dict, out_dir, wandb_kwargs: d
     Fit and save one decoder per image on the frozen encoder_state_dict.
     cfg["model"] must describe that encoder (see merge_model_config).
     resume skips images already listed in <out_dir>/decoders.csv.
+    Every decoder starts from the same initialization (seed), so all of
+    them share one weight-space chart and can be compared or regressed on
+    (experiments/hypernet).
     Returns the decoders.csv rows written by this call.
     """
     # Read the config to do data processing
@@ -150,7 +152,7 @@ def train_decoders(cfg: dict, encoder_state_dict: dict, out_dir, wandb_kwargs: d
         shape = tuple(case["image"].shape[-3:])
 
         # Instantiate a model: the pretrained encoder, frozen, and a fresh decoder.
-        torch.manual_seed(case_seed(seed, case_id))
+        torch.manual_seed(seed)
         model = build_model(cfg["model"], out_features=channels).to(device)
         model.load_encoder_state_dict(encoder_state_dict, freeze=True)
         model.reset_decoder()
@@ -226,9 +228,12 @@ def main():
             raise SystemExit(f"{out_dir} holds decoders for encoder {previous.get('encoder_ckpt')} "
                              f"with model {previous.get('model')}, not {ckpt_dir} with {cfg['model']}; "
                              f"resuming would mix decoders. Choose another --out_dir.")
+        if previous.get("init") != "shared":
+            raise SystemExit(f"{out_dir} holds decoders from per-case initializations (before "
+                             f"shared init); resuming would mix the two. Choose another --out_dir.")
     out_dir.mkdir(parents=True, exist_ok=True)
     with open(saved, "w") as f:
-        json.dump({"encoder_ckpt": str(ckpt_dir), **cfg}, f, indent=2)
+        json.dump({"encoder_ckpt": str(ckpt_dir), "init": "shared", **cfg}, f, indent=2)
     train_decoders(cfg, ckpt["encoder_state_dict"], out_dir, resume=args.resume, seed=args.seed)
 
 

@@ -66,7 +66,7 @@ from models.interfaces import merge_model_config
 from training.train_loop import resolve_device
 from training.sdf_fit import (
     as_affine, to_original_grid, group_names, group_label_values, masks_to_label_map, oracle_dice,
-    prepare_sdf_case, fit_sdf, evaluate_sdf_fit, case_seed,
+    prepare_sdf_case, fit_sdf, evaluate_sdf_fit,
 )
 
 
@@ -254,7 +254,7 @@ def main():
     parser.add_argument("--control_steps", type=int, default=None,
                         help="Steps for each control fit (default: --steps)")
     parser.add_argument("--seed", type=int, default=0,
-                        help="Base seed; per-case seeds match run_translation_test's")
+                        help="Decoder init and point-sampling seed (the same as run_translation_test's)")
     args = parser.parse_args()
     started = time.time()
 
@@ -280,7 +280,7 @@ def main():
     freeze = encoder_state_dict is not None and not args.train_encoder
     source = "frozen encoder" if freeze else \
         "fine-tuned encoder" if encoder_state_dict is not None else "scratch"
-    seed = case_seed(args.seed, case["case_id"])
+    seed = args.seed
     print(f"fitting {args.steps} steps ({source}) on grid {shape}, seed {seed}")
     pred_sdf, _ = fit_sdf(cfg, sdf_case, args.steps, encoder_state_dict=encoder_state_dict,
                           freeze_encoder=freeze, device=device, seed=seed, summarize=True, log=True)
