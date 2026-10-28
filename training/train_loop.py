@@ -27,6 +27,31 @@ from utils.logging_utils import log as wandb_log
 DEFAULT_POINTS_PER_STEP = 2 ** 18
 
 
+def band_indices(target: torch.Tensor, alpha: float) -> torch.Tensor:
+    """Flat indices of the voxels where any channel of a clipped SDF target
+    is inside the unclipped band |sdf| < alpha, i.e. carries shape."""
+    return torch.nonzero((target.abs() < alpha).any(-1)).squeeze(1)
+
+
+def stratified_indices(n: int, band: torch.Tensor, n_points: int, band_fraction: float,
+                       device=None) -> torch.Tensor:
+    """
+    n_points voxel indices out of n: round(band_fraction * n_points) drawn
+    from `band` (band_indices), the rest uniformly from the whole volume, so
+    the clipped plateau, ~95% of a uniform sample, is still learned but no
+    longer swamps the boundary. band_fraction 0 (or an empty band) is plain
+    uniform sampling, the same draw as before stratification existed.
+    """
+    if not 0.0 <= band_fraction <= 1.0:
+        raise ValueError(f"band_fraction must be in [0, 1], got {band_fraction}")
+    n_band = int(round(n_points * band_fraction)) if len(band) else 0
+    uniform = torch.randint(n, (n_points - n_band,), device=device)
+    if n_band == 0:
+        return uniform
+    picked = band[torch.randint(len(band), (n_band,), device=band.device)]
+    return torch.cat([uniform, picked.to(uniform.device)])
+
+
 def build_optimizer(params, optimizer_cfg: dict):
     if optimizer_cfg["name"] == "adamw":
         return torch.optim.AdamW(params, lr=optimizer_cfg["initial_lr"])
@@ -94,10 +119,13 @@ def predict_volume(model, shape: tuple, spacing_mm: tuple, decoder_index: int = 
 def fit_inr(model: EncoderDecoderINR, target: torch.Tensor, shape: tuple, spacing_mm: tuple,
             loss_fn: Callable, steps: int, optimizer_cfg: dict, scheduler_cfg: dict,
             points_per_step: int = DEFAULT_POINTS_PER_STEP, eval_chunk_size: int = 2 ** 20,
-            device="cpu", eval_at=(), on_eval: Callable = None, log: bool = False):
+            device="cpu", eval_at=(), on_eval: Callable = None, log: bool = False,
+            sample_fn: Callable = None):
     """
     Fit head 0 of `model` to one signal for `steps` optimizer steps, each on a
     random batch of points_per_step voxels (None = every voxel).
+    sample_fn(n_points) -> flat voxel indices on device replaces the uniform
+    draw, e.g. stratified_indices for SDFs.
 
     target: (N, C) over the grid `shape` (C-order flattened, as coords_from_indices).
     loss_fn(pred, coords, target_batch) -> dict with "total"; coords require
@@ -122,8 +150,12 @@ def fit_inr(model: EncoderDecoderINR, target: torch.Tensor, shape: tuple, spacin
     for step in range(1, steps + 1):
         t0 = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
-        idx = (torch.arange(n, device=device) if points_per_step is None
-               else torch.randint(n, (points_per_step,), device=device))
+        if points_per_step is None:
+            idx = torch.arange(n, device=device)
+        elif sample_fn is not None:
+            idx = sample_fn(points_per_step)
+        else:
+            idx = torch.randint(n, (points_per_step,), device=device)
         coords = coords_from_indices(idx, shape, spacing_mm).requires_grad_(True)
         loss = loss_fn(model.forward(coords), coords, target[idx])
         loss["total"].backward()

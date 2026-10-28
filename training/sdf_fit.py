@@ -24,7 +24,7 @@ from sdf.coordinates import mm_per_unit
 from sdf.targets import create_multilabel_sdf, build_channel_masks, sdf_to_channel_masks
 from models.interfaces import build_model, print_model_summary
 from training.losses import masked_eikonal_sdf_loss
-from training.train_loop import fit_inr, DEFAULT_POINTS_PER_STEP
+from training.train_loop import fit_inr, band_indices, stratified_indices, DEFAULT_POINTS_PER_STEP
 
 
 # ---------------------------------------------------------------- geometry
@@ -130,6 +130,8 @@ def fit_sdf(cfg: dict, sdf_case: dict, steps: int, encoder_state_dict: dict = No
         excludes evaluation time. The lr schedule always spans `steps`.
     seed: seeds the decoder init and the point sampling, so fits that differ
         only in encoder_state_dict see identical decoders and batches.
+    cfg["sdf"]["band_fraction"] (default 0, uniform): share of each batch
+        drawn from the near-boundary band |sdf| < alpha (stratified_indices).
     Returns (pred_sdf after `steps`, final loss dict as floats).
     """
     if seed is not None:
@@ -157,6 +159,11 @@ def fit_sdf(cfg: dict, sdf_case: dict, steps: int, encoder_state_dict: dict = No
 
     target = torch.from_numpy(np.ascontiguousarray(sdf_case["sdf"])).reshape(-1, k).float()
     scale = mm_per_unit(shape, spacing)
+    band_fraction = sdf_cfg.get("band_fraction", 0.0)
+    sample_fn = None
+    if band_fraction:
+        band = band_indices(target, sdf_cfg["alpha"]).to(device)
+        sample_fn = lambda m: stratified_indices(target.shape[0], band, m, band_fraction, device)
 
     def loss_fn(pred, coords, target_batch):
         return masked_eikonal_sdf_loss(pred, coords, target_batch, sdf_cfg["alpha"],
@@ -170,7 +177,7 @@ def fit_sdf(cfg: dict, sdf_case: dict, steps: int, encoder_state_dict: dict = No
         points_per_step=train_cfg.get("points_per_step", DEFAULT_POINTS_PER_STEP),
         eval_chunk_size=train_cfg.get("eval_chunk_size", 2 ** 20), device=device, eval_at=eval_at,
         on_eval=None if on_eval is None else (lambda step, p, t: on_eval(step, as_volume(p), t)),
-        log=log)
+        log=log, sample_fn=sample_fn)
     return as_volume(pred), final
 
 
