@@ -19,7 +19,7 @@ stacked back into its K channels.
 Methods, all scored on the same held-out test cases:
   floor     per label, one SDF decoder fitted to every training case at once
             (the average shape): what a decoder knows without seeing the case
-  ridge     the highest-bias weight-space map (hypernet.ridge; null skips it):
+  ridge     the highest-bias weight-space map (settings in hypernet.ridge):
             per label, PCA of the training intensity decoders, then ridge
             regression onto the training cases' ceiling decoders, the penalty
             chosen by leave-one-case-out error (experiments/hypernet/ridge.py)
@@ -72,6 +72,9 @@ and ordering in the run summary.
 Usage:
   python -m experiments.hypernet.run_hypernet --config config/training_config.yaml \\
       --decoders_dir checkpoints/encoder_I_intensity_decoders_d64_L2 [--resume]
+      [--methods ridge ceiling]   # any subset of floor ridge hypernet ceiling (default all)
+The floor is trained only when it is scored or the hypernet starts from it;
+ridge alone needs only the training cases' ceiling fits (cached).
 """
 import argparse
 import json
@@ -219,7 +222,8 @@ def report(rows: list, out_dir: Path, wandb_run):
             ordering[f"{method}_beats_floor"] = bool(mean[method] > mean["floor"])
         if "ceiling" in mean and method in mean:
             ordering[f"{method}_below_ceiling"] = bool(mean[method] < mean["ceiling"])
-    print("  " + ", ".join(f"{k}: {v}" for k, v in ordering.items()))
+    if ordering:
+        print("  " + ", ".join(f"{k}: {v}" for k, v in ordering.items()))
     print(f"\nResults: {out_dir / 'results.csv'}; summaries: " +
           ", ".join(f"{out_dir / name}.csv" for name in tables))
 
@@ -245,9 +249,8 @@ def main():
     parser.add_argument("--decoders_dir", default=None, help="Override hypernet.decoders_dir")
     parser.add_argument("--data_root", default=None, help="Default: the decoders' data root")
     parser.add_argument("--out_dir", default=None, help="Default: <decoders_dir>_hypernet")
-    parser.add_argument("--skip_ceiling", action="store_true",
-                        help="Skip the ceiling's test-case fits (ridge still fits training cases)")
-    parser.add_argument("--skip_hypernet", action="store_true", help="Skip training and scoring the MLP")
+    parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS),
+                        help="Methods to run and score (default all); e.g. --methods ridge")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action="store_true",
                         help="Reuse saved floor/hypernet and skip evaluations already in results.csv")
@@ -257,8 +260,9 @@ def main():
     if "sdf" not in cfg:
         raise SystemExit("The config needs an sdf: block (alpha, eikonal_lambda, label_groups, decode_mode).")
     hcfg = {**DEFAULTS, **(cfg.get("hypernet") or {})}
-    if hcfg["ridge"] is not None:
-        hcfg["ridge"] = {**RIDGE_DEFAULTS, **hcfg["ridge"]}
+    hcfg["ridge"] = {**RIDGE_DEFAULTS, **(hcfg["ridge"] or {})}
+    methods = set(args.methods)
+    need_floor = "floor" in methods or ("hypernet" in methods and hcfg["init_from_floor"])
     if args.decoders_dir:
         hcfg["decoders_dir"] = args.decoders_dir
     if not hcfg["decoders_dir"]:
@@ -342,6 +346,13 @@ def main():
     print(f"hypernet: {in_dim:,} intensity-decoder weights + label -> {layout.numel:,} SDF-decoder "
           f"weights ({k} channel{'s' * (k > 1)}) on {dec_config['encoder_ckpt']}; labels {labels}; "
           f"{len(train_items)} train / {len(test_items)} test items; device {device}")
+    plan = {"floor": f"floor ({len(labels)} x {hcfg['floor_steps']} steps)" if need_floor else None,
+            "ridge": f"ridge ({len(split['train'])} training cases' ceiling fits first, then {hcfg['ridge']})",
+            "hypernet": f"hypernet ({hcfg['steps']} steps)",
+            "ceiling": f"ceiling ({hcfg['ceiling_steps']} steps)"}
+    print("methods, in order: " + "; ".join(
+        plan[m] if m in methods or (m == "floor" and need_floor) else f"{m} OFF" for m in plan)
+        + ("  [floor trained only as the hypernet's starting point]" if need_floor and "floor" not in methods else ""))
 
     wandb_run = configure_wandb(cfg["wandb"], f"{cfg['experiment_name']}_hypernet",
                                 {**setup, "sizes": sizes})
@@ -356,13 +367,15 @@ def main():
                                **{f"{prefix}/{k}": v for k, v in values.items()}})
         return log
 
-    # Floor: one decoder per label, fitted to all training cases.
+    # Floor: one decoder per label, fitted to all training cases; only when
+    # it is scored or the hypernet starts from it.
     floor_path = out_dir / "floor_decoders.pt"
-    if args.resume and floor_path.exists():
+    floors = None
+    if need_floor and args.resume and floor_path.exists():
         floors = {label: flatten_state_dict(sd).to(device)
                   for label, sd in torch.load(floor_path, map_location="cpu").items()}
         print(f"floor: reusing {floor_path}")
-    else:
+    elif need_floor:
         floors, saved_floors = {}, {}
         for label in labels:
             print(f"floor {label}: one decoder fitted to all training cases")
@@ -376,9 +389,7 @@ def main():
     # Hypernet.
     hyper_path = out_dir / "hypernet.pt"
     hyper = None
-    if args.skip_hypernet:
-        print("hypernet: skipped (--skip_hypernet)")
-    else:
+    if "hypernet" in methods:
         hyper = HyperMLP(in_dim, layout.numel, len(labels), hcfg["hidden_dim"], hcfg["layers"],
                          hcfg["activation"]).to(device)
     if hyper is not None and args.resume and hyper_path.exists():
@@ -426,7 +437,7 @@ def main():
 
     # Ridge: per label, PCA of the training intensity decoders -> ceiling decoders.
     ridges = {}
-    if hcfg["ridge"] is not None:
+    if "ridge" in methods:
         n_fits = sum(len(parts[c]) for c in split["train"])
         print(f"ridge: {n_fits} ceiling fits of training cases ({hcfg['ceiling_steps']} steps each, "
               f"cached in {ceiling_dir})")
@@ -494,7 +505,7 @@ def main():
             record(method, {**targets[i["case_id"]], **i}, steps, seconds + render_seconds, ev)
 
     print(f"\nevaluating on {len(test_cases)} test cases")
-    for case in test_cases:
+    for case in test_cases if "floor" in methods else []:
         if ("floor", case["case_id"]) not in done:
             ev, _ = predict_and_score(model, [layout.unflatten(floors[p["label"]]) for p in parts[case["case_id"]]],
                                       case, spacing_mm, decode_mode, chunk, device)
@@ -507,7 +518,7 @@ def main():
         score_inputs("hypernet", lambda x, ps: hyper(x, torch.tensor([label_index[p["label"]] for p in ps],
                                                                      device=device)),
                      hcfg["steps"], out_dir / "predicted_decoders")
-    if not args.skip_ceiling:
+    if "ceiling" in methods:
         for case in test_cases:
             if ("ceiling", case["case_id"]) in done:
                 continue
