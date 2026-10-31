@@ -193,19 +193,22 @@ def paired_tests(rows: list) -> list:
     return tests
 
 
-def report(rows: list, out_dir: Path, wandb_run):
-    """Write the summaries and tests, print the headline, mirror to wandb."""
+def report(rows: list, out_dir: Path, wandb_run, split: str = "test") -> list:
+    """Write the summaries and tests, print the headline, mirror to wandb.
+    split "train" writes <name>_train.csv and wandb train/* keys. Returns
+    the per-method summary."""
+    suffix = "" if split == "test" else f"_{split}"
     summary = aggregate_cases(rows, ("method", "steps"), METRICS)
     tables = {"summary": summary,
               "summary_per_label": aggregate_cases(rows, ("method", "task", "label"), METRICS),
               "summary_per_modality": aggregate_cases(rows, ("method", "modality"), METRICS),
               "tests": paired_tests(rows)}
     for name, table in tables.items():
-        write_csv(out_dir / f"{name}.csv", table)
+        write_csv(out_dir / f"{name}{suffix}.csv", table)
 
     metric = "native_dice" if any(not math.isnan(r["native_dice"]) for r in rows) else "dice"
     by_method = {r["method"]: r for r in summary}
-    print(f"\n==== {metric} over test cases: mean / median (n) ====")
+    print(f"\n==== {metric} over {split} cases: mean / median (n) ====")
     for method in METHODS:
         if method in by_method:
             r = by_method[method]
@@ -224,21 +227,37 @@ def report(rows: list, out_dir: Path, wandb_run):
             ordering[f"{method}_below_ceiling"] = bool(mean[method] < mean["ceiling"])
     if ordering:
         print("  " + ", ".join(f"{k}: {v}" for k, v in ordering.items()))
-    print(f"\nResults: {out_dir / 'results.csv'}; summaries: " +
-          ", ".join(f"{out_dir / name}.csv" for name in tables))
+    print(f"\nResults: {out_dir / f'results{suffix}.csv'}; summaries: " +
+          ", ".join(f"{out_dir / name}{suffix}.csv" for name in tables))
 
     if wandb_run is None:
-        return
+        return summary
     import wandb
     clean = lambda v: None if isinstance(v, float) and math.isnan(v) else v
-    wandb_run.summary.update({**ordering, **{f"{r['method']}/{stat}_{m}": clean(r[f"{stat}_{m}"])
-                                             for r in summary for m in METRICS
-                                             for stat in ("mean", "median")}})
+    prefix = "" if split == "test" else f"{split}/"
+    wandb_run.summary.update({**{f"{prefix}{k}": v for k, v in ordering.items()},
+                              **{f"{prefix}{r['method']}/{stat}_{m}": clean(r[f"{stat}_{m}"])
+                                 for r in summary for m in METRICS for stat in ("mean", "median")}})
     for name, table in [("results", rows)] + list(tables.items()):
         if table:
             columns = list(table[0])
-            wandb_run.log({name: wandb.Table(columns=columns,
-                                             data=[[clean(r[c]) for c in columns] for r in table])})
+            wandb_run.log({f"{name}{suffix}": wandb.Table(
+                columns=columns, data=[[clean(r[c]) for c in columns] for r in table])})
+    return summary
+
+
+def print_generalization(train_summary: list, test_summary: list):
+    """Resampled-grid Dice and NSD per method on training vs test cases: a
+    large drop from train to test is overfitting; low on both is not."""
+    train = {r["method"]: r for r in train_summary}
+    test = {r["method"]: r for r in test_summary}
+    print("\n==== train vs test, resampled grid: mean dice | mean nsd ====")
+    print(f"  {'method':<9} {'train':>15} {'test':>15} {'dice gap':>9}")
+    for method in METHODS:
+        if method in train and method in test:
+            a, b = train[method], test[method]
+            print(f"  {method:<9} {a['mean_dice']:>6.4f} | {a['mean_nsd']:.4f} "
+                  f"{b['mean_dice']:>6.4f} | {b['mean_nsd']:.4f} {a['mean_dice'] - b['mean_dice']:>+9.4f}")
 
 
 # ---------------------------------------------------------------- main
@@ -326,7 +345,6 @@ def main():
                 for i in inputs if i["case_id"] in case_ids for p in parts[i["case_id"]]]
 
     train_items, test_items = input_items(set(split["train"])), input_items(test_ids)
-    test_cases = [targets[c] for c in split["test"]]
 
     # The SDF model: frozen encoder, one decoder head whose weights are
     # swapped per case and label. Its fresh init sets the hypernet's per-tensor scale.
@@ -466,68 +484,94 @@ def main():
             wandb_run.summary.update({f"ridge/{label}/{k}": v for label, r in report_ridge.items()
                                       for k, v in r.items() if k != "search"})
 
-    # Evaluate every method on the test cases: each predicts one decoder per
-    # label part, stacked back into the case's K channels for scoring.
-    results = out_dir / "results.csv"
-    done = {(r["method"], r["input"] or r["case_id"])
-            for r in read_rows([results], fieldnames=FIELDS)} if args.resume and results.exists() else set()
-    writer = RowWriter(results, FIELDS, args.resume)
+    # Evaluate every method on the test cases, then the learned ones (floor,
+    # ridge, hypernet) on the training cases, to tell overfitting from
+    # underfitting. Each predicts one decoder per label part, stacked back
+    # into the case's K channels for scoring. Training cases are scored on the
+    # resampled grid only (native_* is NaN): their raw labels are not loaded.
+    def scorable(case_id):
+        case = targets[case_id]
+        if case["sdf_case"] is not None:
+            return case
+        sdf = case["target"].float().reshape(*case["shape"], -1).numpy()
+        return {**case, "sdf_case": {"sdf": sdf, "alpha": alpha, "spacing_mm": spacing_mm,
+                                     "names": case["names"], "native": None}}
 
-    def record(method, item, steps, seconds, ev):
-        rows = [{"method": method, "case_id": item["case_id"], "input": item.get("input", ""),
-                 "task": item["task"], "modality": item.get("modality", ""), "steps": steps,
-                 "fit_seconds": round(seconds, 3), "psnr": ev["psnr"],
-                 **{f: lab[f] for f in FIELDS[8:]}} for lab in ev["labels"]]
-        writer.write(rows)
-        print(f"  {method:<9} {rows[0]['input'] or rows[0]['case_id']}: native/resampled dice " +
-              " ".join(f"{r['label']}={r['native_dice']:.3f}/{r['dice']:.3f}" for r in rows))
-        if wandb_run is not None:
-            wandb_run.log({"case_id": item["case_id"],
-                           f"eval/{method}/mean_native_dice": float(np.nanmean([r["native_dice"] for r in rows])),
-                           f"eval/{method}/mean_dice": float(np.nanmean([r["dice"] for r in rows]))})
+    def evaluate(split_name, case_ids, split_methods, results):
+        done = {(r["method"], r["input"] or r["case_id"]) for r in read_rows([results], fieldnames=FIELDS)} \
+            if args.resume and results.exists() else set()
+        writer = RowWriter(results, FIELDS, args.resume)
+        tag = "" if split_name == "test" else f"[{split_name}] "
 
-    def score_inputs(method, predict, steps, save_dir):
-        """predict(x (m, d), parts) -> (m, p) flat decoders, one per label part."""
-        for i in inputs:
-            if i["case_id"] not in test_ids or (method, i["input"]) in done:
-                continue
-            case_parts = parts[i["case_id"]]
-            t0 = time.perf_counter()
-            with torch.no_grad():
-                predicted = predict(i["x"].to(device).expand(len(case_parts), -1), case_parts)
-            part_params = [layout.unflatten(v.to(device)) for v in predicted]
-            seconds = time.perf_counter() - t0
-            for part, params in zip(case_parts, part_params):
-                save_decoder_weights(dict(zip(keys, (t.cpu() for t in params))),
-                                     part_name(i["input"], part), save_dir)
-            ev, render_seconds = predict_and_score(model, part_params, targets[i["case_id"]], spacing_mm,
-                                                   decode_mode, chunk, device)
-            record(method, {**targets[i["case_id"]], **i}, steps, seconds + render_seconds, ev)
+        def record(method, item, steps, seconds, ev):
+            rows = [{"method": method, "case_id": item["case_id"], "input": item.get("input", ""),
+                     "task": item["task"], "modality": item.get("modality", ""), "steps": steps,
+                     "fit_seconds": round(seconds, 3), "psnr": ev["psnr"],
+                     **{f: lab[f] for f in FIELDS[8:]}} for lab in ev["labels"]]
+            writer.write(rows)
+            print(f"  {tag}{method:<9} {rows[0]['input'] or rows[0]['case_id']}: native/resampled dice " +
+                  " ".join(f"{r['label']}={r['native_dice']:.3f}/{r['dice']:.3f}" for r in rows))
+            if wandb_run is not None:
+                key = "eval" if split_name == "test" else f"eval_{split_name}"
+                # Training cases have no native-grid scores.
+                logged = ("dice", "nsd") + (("native_dice",) if split_name == "test" else ())
+                wandb_run.log({"case_id": item["case_id"],
+                               **{f"{key}/{method}/mean_{m}": float(np.nanmean([r[m] for r in rows]))
+                                  for m in logged}})
 
-    print(f"\nevaluating on {len(test_cases)} test cases")
-    for case in test_cases if "floor" in methods else []:
-        if ("floor", case["case_id"]) not in done:
-            ev, _ = predict_and_score(model, [layout.unflatten(floors[p["label"]]) for p in parts[case["case_id"]]],
-                                      case, spacing_mm, decode_mode, chunk, device)
-            record("floor", case, hcfg["floor_steps"], 0.0, ev)
-    if ridges:
-        score_inputs("ridge", lambda x, ps: torch.cat([ridges[p["label"]].predict(x[j:j + 1])
-                                                       for j, p in enumerate(ps)]),
-                     0, out_dir / "predicted_decoders_ridge")
-    if hyper is not None:
-        score_inputs("hypernet", lambda x, ps: hyper(x, torch.tensor([label_index[p["label"]] for p in ps],
-                                                                     device=device)),
-                     hcfg["steps"], out_dir / "predicted_decoders")
-    if "ceiling" in methods:
-        for case in test_cases:
-            if ("ceiling", case["case_id"]) in done:
-                continue
-            fitted = [ceiling_decoder(case["case_id"], p) for p in parts[case["case_id"]]]
-            ev, _ = predict_and_score(model, [layout.unflatten(v.to(device)) for v, _ in fitted], case,
-                                      spacing_mm, decode_mode, chunk, device)
-            record("ceiling", case, hcfg["ceiling_steps"], sum(t for _, t in fitted), ev)
+        def score_inputs(method, predict, steps, save_dir):
+            """predict(x (m, d), parts) -> (m, p) flat decoders, one per label part.
+            save_dir None: predicted decoders are not saved."""
+            for i in inputs:
+                if i["case_id"] not in case_ids or (method, i["input"]) in done:
+                    continue
+                case_parts = parts[i["case_id"]]
+                t0 = time.perf_counter()
+                with torch.no_grad():
+                    predicted = predict(i["x"].to(device).expand(len(case_parts), -1), case_parts)
+                part_params = [layout.unflatten(v.to(device)) for v in predicted]
+                seconds = time.perf_counter() - t0
+                if save_dir is not None:
+                    for part, params in zip(case_parts, part_params):
+                        save_decoder_weights(dict(zip(keys, (t.cpu() for t in params))),
+                                             part_name(i["input"], part), save_dir)
+                case = scorable(i["case_id"])
+                ev, render_seconds = predict_and_score(model, part_params, case, spacing_mm,
+                                                       decode_mode, chunk, device)
+                record(method, {**case, **i}, steps, seconds + render_seconds, ev)
 
-    report(read_rows([results], INT_FIELDS, FLOAT_FIELDS, FIELDS), out_dir, wandb_run)
+        print(f"\nevaluating on {len(case_ids)} {split_name} cases")
+        save = split_name == "test"
+        for case_id in sorted(case_ids) if "floor" in split_methods else []:
+            if ("floor", case_id) not in done:
+                case = scorable(case_id)
+                ev, _ = predict_and_score(model, [layout.unflatten(floors[p["label"]]) for p in parts[case_id]],
+                                          case, spacing_mm, decode_mode, chunk, device)
+                record("floor", case, hcfg["floor_steps"], 0.0, ev)
+        if ridges and "ridge" in split_methods:
+            score_inputs("ridge", lambda x, ps: torch.cat([ridges[p["label"]].predict(x[j:j + 1])
+                                                           for j, p in enumerate(ps)]),
+                         0, out_dir / "predicted_decoders_ridge" if save else None)
+        if hyper is not None and "hypernet" in split_methods:
+            score_inputs("hypernet", lambda x, ps: hyper(x, torch.tensor([label_index[p["label"]] for p in ps],
+                                                                         device=device)),
+                         hcfg["steps"], out_dir / "predicted_decoders" if save else None)
+        if "ceiling" in split_methods:
+            for case_id in sorted(case_ids):
+                if ("ceiling", case_id) in done:
+                    continue
+                case = scorable(case_id)
+                fitted = [ceiling_decoder(case_id, p) for p in parts[case_id]]
+                ev, _ = predict_and_score(model, [layout.unflatten(v.to(device)) for v, _ in fitted], case,
+                                          spacing_mm, decode_mode, chunk, device)
+                record("ceiling", case, hcfg["ceiling_steps"], sum(t for _, t in fitted), ev)
+        return read_rows([results], INT_FIELDS, FLOAT_FIELDS, FIELDS)
+
+    test_rows = evaluate("test", test_ids, methods, out_dir / "results.csv")
+    train_rows = evaluate("train", set(split["train"]), methods - {"ceiling"}, out_dir / "results_train.csv")
+    test_summary = report(test_rows, out_dir, wandb_run)
+    if train_rows:
+        print_generalization(report(train_rows, out_dir, wandb_run, split="train"), test_summary)
     if wandb_run is not None:
         wandb_run.finish()
 
