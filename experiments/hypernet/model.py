@@ -9,6 +9,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 ACTIVATIONS = {"gelu": nn.GELU, "relu": nn.ReLU, "silu": nn.SiLU}
+NORMS = {"batch": nn.BatchNorm1d, "layer": nn.LayerNorm}
+
+
+def hidden_block(in_dim: int, out_dim: int, activation: str = "gelu", norm: str = None,
+                 dropout: float = 0.0) -> list:
+    """Linear -> [norm] -> activation -> [dropout]: one hidden layer of the
+    hypernetwork. norm: None, "batch" or "layer"."""
+    if norm is not None and norm not in NORMS:
+        raise ValueError(f"Unknown norm {norm!r}; use one of {sorted(NORMS)} or null")
+    if not 0.0 <= dropout < 1.0:
+        raise ValueError(f"dropout must be in [0, 1), got {dropout}")
+    block = [nn.Linear(in_dim, out_dim)]
+    if norm is not None:
+        block.append(NORMS[norm](out_dim))
+    block.append(ACTIVATIONS[activation]())
+    if dropout > 0:
+        block.append(nn.Dropout(dropout))
+    return block
 
 
 def flatten_state_dict(state_dict: dict) -> torch.Tensor:
@@ -82,6 +100,9 @@ class HyperMLP(nn.Module):
     with a one-hot of the label group to predict (sdf.per_label; a single
     label otherwise).
 
+    Hidden layers are hidden_block(..., norm, dropout); the output layer is
+    a plain Linear (no norm or dropout on the predicted weights).
+
     The output is a residual in units of each tensor's own scale:
     weights = base[label] + scale * mlp(x), where base[label] is a reference
     SDF decoder for that label (its floor, or a fresh SIREN init) and scale
@@ -91,17 +112,16 @@ class HyperMLP(nn.Module):
     """
 
     def __init__(self, in_dim: int, out_dim: int, n_labels: int = 1, hidden_dim: int = 1024,
-                 layers: int = 4, activation: str = "gelu"):
+                 layers: int = 4, activation: str = "gelu", norm: str = None, dropout: float = 0.0):
         super().__init__()
         if layers < 2:
             raise ValueError(f"hypernet.layers must be >= 2, got {layers}")
         self.n_labels = n_labels
-        dims = [in_dim + n_labels] + [hidden_dim] * (layers - 1) + [out_dim]
+        dims = [in_dim + n_labels] + [hidden_dim] * (layers - 1)
         blocks = []
-        for i in range(layers):
-            blocks.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < layers - 1:
-                blocks.append(ACTIVATIONS[activation]())
+        for i in range(layers - 1):
+            blocks += hidden_block(dims[i], dims[i + 1], activation, norm, dropout)
+        blocks.append(nn.Linear(hidden_dim, out_dim))
         self.mlp = nn.Sequential(*blocks)
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
@@ -109,6 +129,16 @@ class HyperMLP(nn.Module):
         self.register_buffer("in_std", torch.ones(in_dim))
         self.register_buffer("base", torch.zeros(n_labels, out_dim))
         self.register_buffer("scale", torch.ones(out_dim))
+
+    def param_groups(self, weight_decay: float) -> list:
+        """AdamW groups: weight decay on the Linear weights only, not on biases
+        or norm parameters (decaying a norm's gain shrinks its layer's output,
+        not its complexity). Decay pulls the weights, hence the residual,
+        towards zero, i.e. the prediction towards base."""
+        decay = [m.weight for m in self.mlp if isinstance(m, nn.Linear)]
+        ids = {id(p) for p in decay}
+        return [{"params": decay, "weight_decay": weight_decay},
+                {"params": [p for p in self.parameters() if id(p) not in ids], "weight_decay": 0.0}]
 
     def set_reference(self, inputs: torch.Tensor, base: torch.Tensor, scale: torch.Tensor):
         """inputs: (n_train, in_dim) training vectors, for the standardization;

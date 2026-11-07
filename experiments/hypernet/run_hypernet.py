@@ -111,7 +111,7 @@ RIDGE_DEFAULTS = {"components": None, "alphas": [1e-3, 1e-2, 1e-1, 1.0, 10.0, 10
 
 DEFAULTS = {
     "decoders_dir": None, "test_fraction": 0.2, "split_seed": 0,
-    "hidden_dim": 1024, "layers": 4, "activation": "gelu", "lr": 1e-4, "weight_decay": 0.01,
+    "hidden_dim": 1024, "layers": 4, "activation": "gelu", "norm": None, "dropout": 0.0, "lr": 1e-4, "weight_decay": 0.01,
     "scheduler": "cosine", "steps": 20000, "cases_per_step": 8, "points_per_step": 2 ** 16,
     "log_every": 100, "init_from_floor": True, "floor_steps": 4000, "ceiling_steps": 2000,
     "ridge": None,
@@ -146,23 +146,36 @@ def train_floor(model, layout, train_items, test_items, cfg, hcfg, spacing_mm, d
     return layout.flatten(head)
 
 
-def hypernet_params_for(hyper, layout, items, device):
+def hypernet_params_for(hyper, layout, items, device, eval_mode: bool = False):
     """params_for (experiments/hypernet/train.train_weights) of the hypernet:
-    a batched MLP forward on the chosen items' input vectors and labels."""
+    a batched MLP forward on the chosen items' input vectors and labels.
+    eval_mode: run in eval mode (no dropout, batch norm on its running
+    statistics, which this forward leaves untouched) and switch back --
+    for monitoring test items, which must not shape batch-norm statistics."""
     inputs = torch.stack([i["x"] for i in items]).to(device)
     labels = torch.tensor([i["label_index"] for i in items], device=device)
-    return lambda chosen: [layout.unflatten(v) for v in hyper(inputs[chosen], labels[chosen])]
+
+    def params_for(chosen):
+        was_training = hyper.training
+        hyper.train(not eval_mode and was_training)
+        out = [layout.unflatten(v) for v in hyper(inputs[chosen], labels[chosen])]
+        hyper.train(was_training)
+        return out
+    return params_for
 
 
 def train_hypernet(hyper, model, layout, train_items, test_items, cfg, hcfg, spacing_mm, device,
                    on_log):
-    optimizer = torch.optim.AdamW(hyper.parameters(), lr=hcfg["lr"], weight_decay=hcfg["weight_decay"])
+    if hcfg["norm"] == "batch" and min(hcfg["cases_per_step"], len(train_items)) < 2:
+        raise SystemExit("hypernet.norm: batch needs cases_per_step >= 2 (batch statistics); "
+                         "use norm: layer for tiny batches.")
+    optimizer = torch.optim.AdamW(hyper.param_groups(hcfg["weight_decay"]), lr=hcfg["lr"])
     scheduler = build_scheduler(optimizer, {"name": hcfg["scheduler"]}, hcfg["steps"])
     hyper.train()
     train_weights(model, train_items, hypernet_params_for(hyper, layout, train_items, device),
                   optimizer, scheduler, hcfg["steps"], hcfg["cases_per_step"], hcfg["points_per_step"],
                   cfg["sdf"], spacing_mm, device, hcfg["log_every"], on_log, test_items,
-                  hypernet_params_for(hyper, layout, test_items, device))
+                  hypernet_params_for(hyper, layout, test_items, device, eval_mode=True))
     hyper.eval()
 
 
@@ -409,7 +422,7 @@ def main():
     hyper = None
     if "hypernet" in methods:
         hyper = HyperMLP(in_dim, layout.numel, len(labels), hcfg["hidden_dim"], hcfg["layers"],
-                         hcfg["activation"]).to(device)
+                         hcfg["activation"], hcfg["norm"], hcfg["dropout"]).to(device)
     if hyper is not None and args.resume and hyper_path.exists():
         hyper.load_state_dict(torch.load(hyper_path, map_location=device)["state_dict"])
         hyper.eval()
@@ -426,7 +439,8 @@ def main():
         train_hypernet(hyper, model, layout, train_items, test_items, cfg, hcfg, spacing_mm, device,
                        on_log("hypernet"))
         torch.save({"state_dict": hyper.state_dict(), **sizes, "hidden_dim": hcfg["hidden_dim"],
-                    "layers": hcfg["layers"], "activation": hcfg["activation"]}, hyper_path)
+                    "layers": hcfg["layers"], "activation": hcfg["activation"], "norm": hcfg["norm"],
+                    "dropout": hcfg["dropout"]}, hyper_path)
 
     # Ceiling decoders: a direct fit per (case, label part), cached on disk.
     # Every fit uses the same seed, hence the same initial decoder.
