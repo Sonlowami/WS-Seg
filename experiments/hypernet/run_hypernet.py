@@ -24,6 +24,9 @@ Methods, all scored on the same held-out test cases:
             regression onto the training cases' ceiling decoders, the penalty
             chosen by leave-one-case-out error (experiments/hypernet/ridge.py)
   hypernet  the MLP's prediction from the case's intensity decoder (and label)
+  pca_hypernet  (opt-in) a small HyperMLP from the intensity decoder's PCA
+            coordinates to coefficients on the PCA basis of the training ceiling
+            decoders (settings in hypernet.pca; experiments/hypernet/pca.py)
   ceiling   per label, a decoder fitted to the test case's own SDF (frozen
             encoder, training/sdf_fit.fit_sdf): the best this decoder can do
 Expected: floor < ridge, hypernet < ceiling. Paired Wilcoxon tests over cases
@@ -54,6 +57,7 @@ Outputs in --out_dir (default <decoders_dir>_hypernet):
   split.json             train/test case ids
   floor_decoders.pt      {label: the floor's decoder state_dict}
   hypernet.pt            the MLP (with its normalization and base), sizes, config
+  pca_hypernet.pt        the PCA HyperMLP with its bases; predicted_decoders_pca/ its predictions
   predicted_decoders/    each test input's (and label's) predicted SDF decoder
   predicted_decoders_ridge/   the same for ridge
   ceiling_decoders/      every ceiling fit (training and test cases), reused on --resume
@@ -72,9 +76,10 @@ and ordering in the run summary.
 Usage:
   python -m experiments.hypernet.run_hypernet --config config/training_config.yaml \\
       --decoders_dir checkpoints/encoder_I_intensity_decoders_d64_L2 [--resume]
-      [--methods ridge ceiling]   # any subset of floor ridge hypernet ceiling (default all)
+      [--methods ridge ceiling]   # any of floor ridge hypernet pca_hypernet ceiling
+                                  # (default all but pca_hypernet)
 The floor is trained only when it is scored or the hypernet starts from it;
-ridge alone needs only the training cases' ceiling fits (cached).
+ridge and pca_hypernet need only the training cases' ceiling fits (cached, shared).
 """
 import argparse
 import json
@@ -88,6 +93,7 @@ import torch
 from experiments.hypernet.data import load_decoder_bank, split_cases, load_sdf_targets, label_targets
 from experiments.hypernet.model import HeadLayout, HyperMLP, flatten_state_dict
 from experiments.hypernet.ridge import PCARidge
+from experiments.hypernet.pca import PCAHyperNet, pca_basis, output_bases
 from experiments.hypernet.train import train_weights, predict_and_score
 from models.interfaces import DECODER_KEYS, build_model
 from training.sdf_fit import fit_sdf
@@ -105,16 +111,24 @@ FLOAT_FIELDS = ("fit_seconds", "psnr", "dice", "nsd", "oracle_dice", "native_dic
 METRICS = ("native_dice", "dice", "native_nsd", "nsd")
 # Each pair is reported as first - second; all are expected to be positive.
 PAIRS = (("hypernet", "floor"), ("ridge", "floor"), ("hypernet", "ridge"),
-         ("ceiling", "hypernet"), ("ceiling", "ridge"), ("ceiling", "floor"))
-METHODS = ("floor", "ridge", "hypernet", "ceiling")
+         ("pca_hypernet", "floor"), ("pca_hypernet", "ridge"), ("pca_hypernet", "hypernet"),
+         ("ceiling", "hypernet"), ("ceiling", "ridge"), ("ceiling", "pca_hypernet"), ("ceiling", "floor"))
+METHODS = ("floor", "ridge", "hypernet", "pca_hypernet", "ceiling")
+DEFAULT_METHODS = ("floor", "ridge", "hypernet", "ceiling")
+LEARNED = ("ridge", "hypernet", "pca_hypernet")
 RIDGE_DEFAULTS = {"components": None, "alphas": [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0]}
+# pca_hypernet: its own MLP size and regularization; every other training
+# setting (steps, lr, weight_decay, cases_per_step, ...) defaults to the
+# hypernet block's and can be overridden inside hypernet.pca.
+PCA_DEFAULTS = {"components_in": None, "components_out": None, "hidden_dim": 64, "layers": 3,
+                "norm": None, "dropout": 0.0}
 
 DEFAULTS = {
     "decoders_dir": None, "test_fraction": 0.2, "split_seed": 0,
     "hidden_dim": 1024, "layers": 4, "activation": "gelu", "norm": None, "dropout": 0.0, "lr": 1e-4, "weight_decay": 0.01,
     "scheduler": "cosine", "steps": 20000, "cases_per_step": 8, "points_per_step": 2 ** 16,
     "log_every": 100, "init_from_floor": True, "floor_steps": 4000, "ceiling_steps": 2000,
-    "ridge": None,
+    "ridge": None, "pca": None,
 }
 
 
@@ -225,15 +239,15 @@ def report(rows: list, out_dir: Path, wandb_run, split: str = "test") -> list:
     for method in METHODS:
         if method in by_method:
             r = by_method[method]
-            print(f"  {method:<9} {r[f'mean_{metric}']:.4f} / {r[f'median_{metric}']:.4f} "
+            print(f"  {method:<12} {r[f'mean_{metric}']:.4f} / {r[f'median_{metric}']:.4f} "
                   f"({r[f'n_{metric}']})")
     for t in tables["tests"]:
         if t["metric"] == metric:
-            print(f"  {t['pair']:<20} median diff {t['median_diff']:+.4f}, p_holm={t['p_holm']:.3g} "
+            print(f"  {t['pair']:<26} median diff {t['median_diff']:+.4f}, p_holm={t['p_holm']:.3g} "
                   f"(n={t['n']})")
     mean = {m: by_method[m][f"mean_{metric}"] for m in by_method}
     ordering = {}
-    for method in ("ridge", "hypernet"):
+    for method in LEARNED:
         if "floor" in mean and method in mean:
             ordering[f"{method}_beats_floor"] = bool(mean[method] > mean["floor"])
         if "ceiling" in mean and method in mean:
@@ -265,11 +279,11 @@ def print_generalization(train_summary: list, test_summary: list):
     train = {r["method"]: r for r in train_summary}
     test = {r["method"]: r for r in test_summary}
     print("\n==== train vs test, resampled grid: mean dice | mean nsd ====")
-    print(f"  {'method':<9} {'train':>15} {'test':>15} {'dice gap':>9}")
+    print(f"  {'method':<12} {'train':>15} {'test':>15} {'dice gap':>9}")
     for method in METHODS:
         if method in train and method in test:
             a, b = train[method], test[method]
-            print(f"  {method:<9} {a['mean_dice']:>6.4f} | {a['mean_nsd']:.4f} "
+            print(f"  {method:<12} {a['mean_dice']:>6.4f} | {a['mean_nsd']:.4f} "
                   f"{b['mean_dice']:>6.4f} | {b['mean_nsd']:.4f} {a['mean_dice'] - b['mean_dice']:>+9.4f}")
 
 
@@ -281,8 +295,9 @@ def main():
     parser.add_argument("--decoders_dir", default=None, help="Override hypernet.decoders_dir")
     parser.add_argument("--data_root", default=None, help="Default: the decoders' data root")
     parser.add_argument("--out_dir", default=None, help="Default: <decoders_dir>_hypernet")
-    parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS),
-                        help="Methods to run and score (default all); e.g. --methods ridge")
+    parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(DEFAULT_METHODS),
+                        help="Methods to run and score (default all but pca_hypernet); "
+                             "e.g. --methods pca_hypernet")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action="store_true",
                         help="Reuse saved floor/hypernet and skip evaluations already in results.csv")
@@ -293,6 +308,7 @@ def main():
         raise SystemExit("The config needs an sdf: block (alpha, eikonal_lambda, label_groups, decode_mode).")
     hcfg = {**DEFAULTS, **(cfg.get("hypernet") or {})}
     hcfg["ridge"] = {**RIDGE_DEFAULTS, **(hcfg["ridge"] or {})}
+    pcfg = {**hcfg, **PCA_DEFAULTS, **(hcfg["pca"] or {})}
     methods = set(args.methods)
     need_floor = "floor" in methods or ("hypernet" in methods and hcfg["init_from_floor"])
     if args.decoders_dir:
@@ -380,6 +396,8 @@ def main():
     plan = {"floor": f"floor ({len(labels)} x {hcfg['floor_steps']} steps)" if need_floor else None,
             "ridge": f"ridge ({len(split['train'])} training cases' ceiling fits first, then {hcfg['ridge']})",
             "hypernet": f"hypernet ({hcfg['steps']} steps)",
+            "pca_hypernet": f"pca_hypernet ({pcfg['steps']} steps, {pcfg['layers']} layers x "
+                            f"{pcfg['hidden_dim']}, k_in={pcfg['components_in']}, k_out={pcfg['components_out']})",
             "ceiling": f"ceiling ({hcfg['ceiling_steps']} steps)"}
     print("methods, in order: " + "; ".join(
         plan[m] if m in methods or (m == "floor" and need_floor) else f"{m} OFF" for m in plan)
@@ -388,7 +406,7 @@ def main():
     wandb_run = configure_wandb(cfg["wandb"], f"{cfg['experiment_name']}_hypernet",
                                 {**setup, "sizes": sizes})
     if wandb_run is not None:
-        for prefix in ("floor", "hypernet"):
+        for prefix in ("floor", "hypernet", "pca_hypernet"):
             wandb_run.define_metric(f"{prefix}/*", step_metric=f"{prefix}/step")
 
     def on_log(prefix):
@@ -467,17 +485,21 @@ def main():
         save_decoder_weights(state, part_name(case_id, part), ceiling_dir)
         return flatten_state_dict(state), seconds
 
-    # Ridge: per label, PCA of the training intensity decoders -> ceiling decoders.
-    ridges = {}
-    if "ridge" in methods:
+    # The training cases' ceiling decoders: ridge's targets and
+    # pca_hypernet's output basis. Fitted (or read from the cache) once.
+    ceilings = {}
+    if methods & {"ridge", "pca_hypernet"}:
         n_fits = sum(len(parts[c]) for c in split["train"])
-        print(f"ridge: {n_fits} ceiling fits of training cases ({hcfg['ceiling_steps']} steps each, "
+        print(f"{n_fits} ceiling fits of training cases ({hcfg['ceiling_steps']} steps each, "
               f"cached in {ceiling_dir})")
-        ceilings = {}
         for n, c in enumerate(split["train"], 1):
             for part in parts[c]:
                 ceilings[(c, part["label"])] = ceiling_decoder(c, part)[0]
             print(f"  [{n}/{len(split['train'])}] {c}")
+
+    # Ridge: per label, PCA of the training intensity decoders -> ceiling decoders.
+    ridges = {}
+    if "ridge" in methods:
         report_ridge = {}
         for label in labels:
             rows = [i for i in train_items if i["label"] == label]
@@ -497,6 +519,39 @@ def main():
         if wandb_run is not None:
             wandb_run.summary.update({f"ridge/{label}/{k}": v for label, r in report_ridge.items()
                                       for k, v in r.items() if k != "search"})
+
+    # PCA hypernet: HyperMLP from input PCA coordinates to output PCA coefficients.
+    pca_net = None
+    if "pca_hypernet" in methods:
+        train_x = torch.stack([i["x"] for i in inputs if i["case_id"] not in test_ids])
+        x_mean, x_basis, _ = pca_basis(train_x, pcfg["components_in"])
+        y_mean, y_basis = output_bases([torch.stack([ceilings[(c, label)] for c in split["train"]
+                                                     if (c, label) in ceilings]) for label in labels],
+                                       pcfg["components_out"])
+        pca_net = PCAHyperNet(x_mean, x_basis, y_mean, y_basis, hidden_dim=pcfg["hidden_dim"],
+                              layers=pcfg["layers"], activation=pcfg["activation"], norm=pcfg["norm"],
+                              dropout=pcfg["dropout"]).to(device)
+        pca_path = out_dir / "pca_hypernet.pt"
+        n_params = sum(p.numel() for p in pca_net.parameters())
+        print(f"pca_hypernet: {train_x.shape[1]:,} weights -> {x_basis.shape[0]} input coordinates -> "
+              f"{pcfg['layers']}-layer MLP, {pcfg['hidden_dim']} wide, {n_params:,} params -> "
+              f"{y_basis.shape[1]} output coefficients per label -> {layout.numel:,} weights")
+        if args.resume and pca_path.exists():
+            pca_net.load_state_dict(torch.load(pca_path, map_location=device)["state_dict"])
+            pca_net.eval()
+            print(f"pca_hypernet: reusing {pca_path}")
+        else:
+            torch.manual_seed(args.seed)
+            pca_net.set_reference(train_x.to(device))
+            train_hypernet(pca_net, model, layout, train_items, test_items, cfg, pcfg, spacing_mm,
+                           device, on_log("pca_hypernet"))
+            torch.save({"state_dict": pca_net.state_dict(), "pca": {k: pcfg[k] for k in PCA_DEFAULTS},
+                        "k_in": x_basis.shape[0], "k_out": y_basis.shape[1], "params": n_params,
+                        **sizes}, pca_path)
+        if wandb_run is not None:
+            wandb_run.summary.update({"pca_hypernet/k_in": x_basis.shape[0],
+                                      "pca_hypernet/k_out": y_basis.shape[1],
+                                      "pca_hypernet/params": n_params})
 
     # Evaluate every method on the test cases, then the learned ones (floor,
     # ridge, hypernet) on the training cases, to tell overfitting from
@@ -523,7 +578,7 @@ def main():
                      "fit_seconds": round(seconds, 3), "psnr": ev["psnr"],
                      **{f: lab[f] for f in FIELDS[8:]}} for lab in ev["labels"]]
             writer.write(rows)
-            print(f"  {tag}{method:<9} {rows[0]['input'] or rows[0]['case_id']}: native/resampled dice " +
+            print(f"  {tag}{method:<12} {rows[0]['input'] or rows[0]['case_id']}: native/resampled dice " +
                   " ".join(f"{r['label']}={r['native_dice']:.3f}/{r['dice']:.3f}" for r in rows))
             if wandb_run is not None:
                 key = "eval" if split_name == "test" else f"eval_{split_name}"
@@ -570,6 +625,10 @@ def main():
             score_inputs("hypernet", lambda x, ps: hyper(x, torch.tensor([label_index[p["label"]] for p in ps],
                                                                          device=device)),
                          hcfg["steps"], out_dir / "predicted_decoders" if save else None)
+        if pca_net is not None and "pca_hypernet" in split_methods:
+            score_inputs("pca_hypernet", lambda x, ps: pca_net(x, torch.tensor([label_index[p["label"]] for p in ps],
+                                                                               device=device)),
+                         pcfg["steps"], out_dir / "predicted_decoders_pca" if save else None)
         if "ceiling" in split_methods:
             for case_id in sorted(case_ids):
                 if ("ceiling", case_id) in done:
