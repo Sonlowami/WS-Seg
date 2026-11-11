@@ -46,3 +46,15 @@ def test_only_the_mlp_is_trainable():
     assert trainable == {id(p) for p in net.hyper.parameters()}
     groups = net.param_groups(0.1)
     assert sum(len(g["params"]) for g in groups) == len(trainable)
+
+
+def test_starts_at_a_given_origin_and_can_reach_the_mean():
+    X, Y = _decoders(5, 30, 7), _decoders(5, 12, 8)
+    floor = _decoders(1, 12, 9)
+    origin, y_basis = output_bases([Y], origins=floor)
+    assert torch.equal(origin, floor) and y_basis.shape == (1, 5, 12)     # mean direction + 4
+    assert torch.allclose(origin[0] + y_basis[0, 0], Y.mean(0), atol=1e-5)
+    net = PCAHyperNet(*pca_basis(X)[:2], origin, y_basis, hidden_dim=8, layers=3)
+    net.set_reference(X)
+    label = torch.zeros(5, dtype=torch.long)
+    assert torch.allclose(net(X, label), floor.expand(5, -1))

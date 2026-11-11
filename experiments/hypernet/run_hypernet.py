@@ -91,7 +91,7 @@ import numpy as np
 import torch
 
 from experiments.hypernet.data import load_decoder_bank, split_cases, load_sdf_targets, label_targets
-from experiments.hypernet.model import HeadLayout, HyperMLP, flatten_state_dict
+from experiments.hypernet.model import HeadLayout, HyperMLP, flatten_state_dict, print_hypernet_summary
 from experiments.hypernet.ridge import PCARidge
 from experiments.hypernet.pca import PCAHyperNet, pca_basis, output_bases
 from experiments.hypernet.train import train_weights, predict_and_score
@@ -117,11 +117,12 @@ METHODS = ("floor", "ridge", "hypernet", "pca_hypernet", "ceiling")
 DEFAULT_METHODS = ("floor", "ridge", "hypernet", "ceiling")
 LEARNED = ("ridge", "hypernet", "pca_hypernet")
 RIDGE_DEFAULTS = {"components": None, "alphas": [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0, 1000.0]}
-# pca_hypernet: its own MLP size and regularization; every other training
-# setting (steps, lr, weight_decay, cases_per_step, ...) defaults to the
-# hypernet block's and can be overridden inside hypernet.pca.
-PCA_DEFAULTS = {"components_in": None, "components_out": None, "hidden_dim": 64, "layers": 3,
-                "norm": None, "dropout": 0.0}
+# pca_hypernet differs from hypernet only in its input/output representation:
+# the MLP (hidden_dim, layers, activation, norm, dropout), its initialization
+# and every training setting (steps, lr, weight_decay, scheduler, batches) are
+# the hypernet block's. A key set inside hypernet.pca overrides it, which
+# makes the two no longer like for like.
+PCA_DEFAULTS = {"components_in": None, "components_out": None}
 
 DEFAULTS = {
     "decoders_dir": None, "test_fraction": 0.2, "split_seed": 0,
@@ -310,7 +311,9 @@ def main():
     hcfg["ridge"] = {**RIDGE_DEFAULTS, **(hcfg["ridge"] or {})}
     pcfg = {**hcfg, **PCA_DEFAULTS, **(hcfg["pca"] or {})}
     methods = set(args.methods)
-    need_floor = "floor" in methods or ("hypernet" in methods and hcfg["init_from_floor"])
+    # The floor is trained when scored or when a hypernet starts from it.
+    need_floor = "floor" in methods or (bool(methods & {"hypernet", "pca_hypernet"})
+                                        and hcfg["init_from_floor"])
     if args.decoders_dir:
         hcfg["decoders_dir"] = args.decoders_dir
     if not hcfg["decoders_dir"]:
@@ -439,14 +442,20 @@ def main():
     hyper_path = out_dir / "hypernet.pt"
     hyper = None
     if "hypernet" in methods:
+        # Seeded here so the MLP's initial weights do not depend on what ran
+        # before (floor, ceiling fits); reseeded below for the batches. The
+        # PCA hypernet does the same.
+        torch.manual_seed(args.seed)
         hyper = HyperMLP(in_dim, layout.numel, len(labels), hcfg["hidden_dim"], hcfg["layers"],
                          hcfg["activation"], hcfg["norm"], hcfg["dropout"]).to(device)
+        n_params = print_hypernet_summary(hyper, in_dim, "hypernet (full decoder weights)")
+        if wandb_run is not None:
+            wandb_run.summary.update({"hypernet/params": n_params})
     if hyper is not None and args.resume and hyper_path.exists():
         hyper.load_state_dict(torch.load(hyper_path, map_location=device)["state_dict"])
         hyper.eval()
         print(f"hypernet: reusing {hyper_path}")
     elif hyper is not None:
-        n_params = sum(p.numel() for p in hyper.parameters())
         print(f"hypernet: {hcfg['layers']}-layer MLP, {hcfg['hidden_dim']} wide, {n_params:,} params, "
               f"starting from the {'floor' if hcfg['init_from_floor'] else 'fresh SIREN init'}")
         torch.manual_seed(args.seed)
@@ -525,19 +534,33 @@ def main():
     if "pca_hypernet" in methods:
         train_x = torch.stack([i["x"] for i in inputs if i["case_id"] not in test_ids])
         x_mean, x_basis, _ = pca_basis(train_x, pcfg["components_in"])
-        y_mean, y_basis = output_bases([torch.stack([ceilings[(c, label)] for c in split["train"]
+        # Same starting decoder as the full-weights hypernet (its base).
+        start = "floor" if hcfg["init_from_floor"] else "fresh SIREN init"
+        origins = (torch.stack([floors[label] for label in labels]) if hcfg["init_from_floor"]
+                   else fresh.expand(len(labels), -1))
+        origin, y_basis = output_bases([torch.stack([ceilings[(c, label)] for c in split["train"]
                                                      if (c, label) in ceilings]) for label in labels],
-                                       pcfg["components_out"])
-        pca_net = PCAHyperNet(x_mean, x_basis, y_mean, y_basis, hidden_dim=pcfg["hidden_dim"],
+                                       pcfg["components_out"], origins)
+        torch.manual_seed(args.seed)                       # as for the hypernet's MLP
+        pca_net = PCAHyperNet(x_mean, x_basis, origin, y_basis, hidden_dim=pcfg["hidden_dim"],
                               layers=pcfg["layers"], activation=pcfg["activation"], norm=pcfg["norm"],
                               dropout=pcfg["dropout"]).to(device)
         pca_path = out_dir / "pca_hypernet.pt"
-        n_params = sum(p.numel() for p in pca_net.parameters())
+        n_params = print_hypernet_summary(pca_net, train_x.shape[1], "pca_hypernet (PCA coordinates)")
+        differs = {k: (hcfg[k], pcfg[k]) for k in hcfg if k not in ("pca", "ridge") and pcfg[k] != hcfg[k]}
+        if differs:
+            print(f"WARNING: pca_hypernet overrides hypernet settings {differs} (hypernet, pca); "
+                  f"the two are no longer compared like for like.")
         print(f"pca_hypernet: {train_x.shape[1]:,} weights -> {x_basis.shape[0]} input coordinates -> "
               f"{pcfg['layers']}-layer MLP, {pcfg['hidden_dim']} wide, {n_params:,} params -> "
-              f"{y_basis.shape[1]} output coefficients per label -> {layout.numel:,} weights")
+              f"{y_basis.shape[1]} output coefficients per label -> {layout.numel:,} weights, "
+              f"starting from the {start}")
         if args.resume and pca_path.exists():
-            pca_net.load_state_dict(torch.load(pca_path, map_location=device)["state_dict"])
+            saved_pca = torch.load(pca_path, map_location=device)
+            if saved_pca.get("start") != start:
+                raise SystemExit(f"{pca_path} was trained from the {saved_pca.get('start', 'mean ceiling decoder')}, "
+                                 f"not the {start}; delete it or choose another --out_dir.")
+            pca_net.load_state_dict(saved_pca["state_dict"])
             pca_net.eval()
             print(f"pca_hypernet: reusing {pca_path}")
         else:
@@ -545,7 +568,8 @@ def main():
             pca_net.set_reference(train_x.to(device))
             train_hypernet(pca_net, model, layout, train_items, test_items, cfg, pcfg, spacing_mm,
                            device, on_log("pca_hypernet"))
-            torch.save({"state_dict": pca_net.state_dict(), "pca": {k: pcfg[k] for k in PCA_DEFAULTS},
+            torch.save({"state_dict": pca_net.state_dict(), "start": start,
+                        "pca": {k: pcfg[k] for k in PCA_DEFAULTS},
                         "k_in": x_basis.shape[0], "k_out": y_basis.shape[1], "params": n_params,
                         **sizes}, pca_path)
         if wandb_run is not None:

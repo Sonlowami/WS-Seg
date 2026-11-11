@@ -92,6 +92,33 @@ def load_head(head: nn.Module, params: list):
             p.copy_(value)
 
 
+def print_hypernet_summary(net: nn.Module, in_dim: int, title: str) -> int:
+    """torchinfo layer table of a hypernetwork (HyperMLP or PCAHyperNet, run
+    in eval mode on a dummy batch of 2), its trainable parameter count and
+    its fixed buffers (input normalization, PCA bases, base decoders). The
+    random state is restored, so printing never shifts a seeded run.
+    Returns the trainable parameter count."""
+    from torchinfo import summary
+
+    device = next(net.parameters()).device
+    was_training = net.training
+    cpu_state = torch.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    net.eval()
+    stats = summary(net, input_data=[torch.zeros(2, in_dim, device=device),
+                                     torch.zeros(2, dtype=torch.long, device=device)],
+                    depth=4, verbose=0, col_names=("input_size", "output_size", "num_params"))
+    net.train(was_training)
+    torch.set_rng_state(cpu_state)
+    if cuda_states is not None:
+        torch.cuda.set_rng_state_all(cuda_states)
+    trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
+    fixed = sum(b.numel() for b in net.buffers())
+    print(f"\n{title}\n{stats}\nParameters: trainable={trainable:,}; fixed buffers "
+          f"(normalization, bases, base decoders)={fixed:,}\n")
+    return trainable
+
+
 class HyperMLP(nn.Module):
     """
     (in_dim + n_labels) -> hidden_dim -> ... -> out_dim, `layers` Linear
