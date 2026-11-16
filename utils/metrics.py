@@ -13,8 +13,12 @@ from skimage.metrics import structural_similarity as sk_ssim
 
 
 def psnr_3d(pred: np.ndarray, target: np.ndarray, data_range: float = None) -> float:
+    """NaN for a constant target (data range 0, e.g. an all-background slice):
+    PSNR is undefined there."""
     if data_range is None:
         data_range = target.max() - target.min()
+    if data_range <= 0:
+        return float("nan")
     mse = np.mean((pred - target) ** 2)
     if mse == 0:
         return float("inf")
@@ -23,10 +27,21 @@ def psnr_3d(pred: np.ndarray, target: np.ndarray, data_range: float = None) -> f
 
 def ssim_3d(pred: np.ndarray, target: np.ndarray, data_range: float = None,
             channel_axis: int = None) -> float:
-    """channel_axis=-1 for (D, H, W, K) multi-channel volumes; None for (D, H, W)."""
+    """channel_axis=-1 for (D, H, W, K) multi-channel volumes; None for (D, H, W).
+    Size-1 spatial axes are dropped, so a slice kept as a one-voxel-thick
+    volume (experiments/slices) is scored as the 2D image it is. NaN for a
+    constant target, as psnr_3d."""
     if data_range is None:
         data_range = target.max() - target.min()
-    return float(sk_ssim(pred, target, data_range=data_range, channel_axis=channel_axis))
+    if data_range <= 0:
+        return float("nan")
+    if channel_axis is not None:
+        pred, target = np.moveaxis(pred, channel_axis, -1), np.moveaxis(target, channel_axis, -1)
+    spatial = pred.shape[:-1] if channel_axis is not None else pred.shape
+    flat = tuple(i for i, n in enumerate(spatial) if n == 1)
+    pred, target = pred.squeeze(flat), target.squeeze(flat)
+    return float(sk_ssim(pred, target, data_range=data_range,
+                         channel_axis=-1 if channel_axis is not None else None))
 
 def metric_fn(pred, target, shape, channels):
     full_shape = (*shape, channels)

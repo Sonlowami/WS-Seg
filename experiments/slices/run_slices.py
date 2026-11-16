@@ -74,7 +74,7 @@ from training.train_loop import fit_inr, predict_volume, resolve_device, train_e
 from utils.config import load_config
 from utils.io import load_model_weights, save_decoder_weights, save_encoder_weights
 from utils.logging_utils import configure_wandb
-from utils.metrics import psnr_3d
+from utils.metrics import metric_fn
 from utils.results_io import RowWriter, read_rows, write_csv
 from utils.stats import aggregate_cases
 
@@ -144,7 +144,7 @@ def slice_encoder(cfg, scfg, cases, train_ids, out_dir, spacing_mm, device, seed
     train_cfg = cfg.get("training") or {}
     state = train_encoder_jointly(
         items, model, lambda pred, coords, target: {"total": image_reconstruction_loss(pred, target)},
-        lambda pred, target, shape: {"psnr": psnr_3d(pred.numpy(), target.numpy())},
+        lambda pred, target, shape: metric_fn(pred, target, shape, 1),    # PSNR + SSIM, as Encoder I
         cfg["optimizer"], cfg["scheduler"], scfg["encoder_steps"], max(scfg["encoder_steps"] // 10, 1),
         wandb_run, spacing_mm, cases_per_step=train_cfg.get("cases_per_step", 8),
         points_per_step=scfg["points_per_step"], eval_chunk_size=train_cfg.get("eval_chunk_size", 2 ** 20),

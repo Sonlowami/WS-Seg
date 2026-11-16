@@ -3,6 +3,7 @@ import torch
 
 from experiments.slices.data import put_slice, slice_index
 from sdf.coordinates import coords_from_indices
+from utils.metrics import metric_fn, psnr_3d, ssim_3d
 
 
 def test_slice_index_keeps_the_axis():
@@ -23,3 +24,14 @@ def test_one_voxel_thick_slices_have_a_constant_sliced_coordinate():
     coords = coords_from_indices(torch.arange(4 * 5), (4, 5, 1))
     assert torch.unique(coords[:, 2]).numel() == 1
     assert torch.unique(coords[:, 0]).numel() == 4 and torch.unique(coords[:, 1]).numel() == 5
+
+
+def test_metrics_score_a_slice_as_2d_and_a_constant_target_as_nan():
+    rng = np.random.RandomState(0)
+    target = rng.rand(32, 24, 1).astype(np.float32)
+    pred = target + 0.05 * rng.randn(32, 24, 1).astype(np.float32)
+    assert abs(ssim_3d(pred, target) - ssim_3d(pred[..., 0], target[..., 0])) < 1e-6
+    m = metric_fn(torch.from_numpy(pred).reshape(-1, 1), torch.from_numpy(target).reshape(-1, 1), (32, 24, 1), 1)
+    assert np.isfinite(m["psnr"]) and 0 < m["ssim"] <= 1
+    flat = np.zeros((32, 24, 1), dtype=np.float32)
+    assert np.isnan(psnr_3d(pred, flat)) and np.isnan(ssim_3d(pred, flat))
