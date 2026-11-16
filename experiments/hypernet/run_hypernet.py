@@ -91,7 +91,8 @@ import numpy as np
 import torch
 
 from experiments.hypernet.data import load_decoder_bank, split_cases, load_sdf_targets, label_targets
-from experiments.hypernet.model import HeadLayout, HyperMLP, flatten_state_dict, print_hypernet_summary
+from experiments.hypernet.model import (HeadLayout, HyperMLP, flatten_state_dict, load_head,
+                                        print_hypernet_summary)
 from experiments.hypernet.ridge import PCARidge
 from experiments.hypernet.pca import PCAHyperNet, pca_basis, output_bases
 from experiments.hypernet.train import train_weights, predict_and_score
@@ -143,11 +144,13 @@ def sdf_model_config(decoder_model: dict, hcfg: dict) -> dict:
 
 # ---------------------------------------------------------------- training
 
-def train_floor(model, layout, train_items, test_items, cfg, hcfg, spacing_mm, device, on_log):
-    """One fresh decoder fitted to all of train_items (every training case's
-    target for one label); returns its flat weights."""
-    model.reset_decoder()
+def train_floor(model, layout, train_items, test_items, cfg, hcfg, spacing_mm, device, on_log, init):
+    """One decoder fitted to all of train_items (every training case's target
+    for one label), starting from init -- the experiment's shared initial
+    decoder (flat), so the floor starts where every other decoder does.
+    Returns its flat weights."""
     head = model.decoder[0]
+    load_head(head, layout.unflatten(init.to(next(head.parameters()).device)))
     for p in head.parameters():
         p.requires_grad_(True)
     optimizer = build_optimizer(list(head.parameters()), cfg["optimizer"])
@@ -434,7 +437,7 @@ def main():
             torch.manual_seed(args.seed)
             floors[label] = train_floor(model, layout, label_parts(split["train"], label),
                                         label_parts(test_ids, label), cfg, hcfg, spacing_mm, device,
-                                        on_log(f"floor/{label}" if per_label else "floor"))
+                                        on_log(f"floor/{label}" if per_label else "floor"), fresh)
             saved_floors[label] = {n: v.detach().cpu().clone() for n, v in model.decoder_state_dict().items()}
         torch.save(saved_floors, floor_path)
 
