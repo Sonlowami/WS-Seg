@@ -19,6 +19,15 @@ information, for data-hungry learners such as transformers. Methods:
             2D counterpart of the 3D floor (which knows z through its
             coordinates). hypernet - position_only is what the image adds.
             Needs slices.use_position.
+  transformer  SliceTransformer (experiments/slices/transformer.py): every
+            slice's SDF decoder from the whole stack of its volume's slice
+            intensity decoders (raw tokens + Fourier position + label
+            embedding, slices.transformer_dim / _layers / _heads), with the
+            hypernet block's dropout, optimizer, steps, items and points per
+            step and floor start. Trained and scored on whole stacks, so only
+            at stride-1 points (slices.base_stride: 1). No augmentation.
+  transformer_nocontext  the same model with each token attending only to
+            itself: transformer - transformer_nocontext is what context adds.
   ceiling   each test slice's own fitted SDF decoder (test slices only)
 For scoring, each test case's predicted slices are stacked back into its
 volume and scored exactly like the 3D experiment -- resampled and native
@@ -64,6 +73,10 @@ Usage:
   the encoder, the slice decoders and every result already written; --points
   limits the run to some learning-curve points, e.g.
     ... --methods position_only --points cases1_stride2 --resume
+  base_stride, points and the transformer sizes may change between resumed
+  runs: they pick which cached slices are used, not how any decoder is fitted.
+  The transformer, e.g. (slices.base_stride: 1, a point [1.0, 1]):
+    ... --methods transformer transformer_nocontext --points cases1_stride1 --resume
 """
 import argparse
 import json
@@ -76,12 +89,14 @@ import torch
 from experiments.hypernet.data import split_cases, label_targets
 from experiments.hypernet.model import HeadLayout, HyperMLP, flatten_state_dict, load_head, print_hypernet_summary
 from experiments.hypernet.run_hypernet import DEFAULTS as HYPERNET_DEFAULTS, train_floor, train_hypernet
+from experiments.hypernet.train import train_weights
 from experiments.slices.data import load_slice_cases, put_slice
+from experiments.slices.transformer import SliceTransformer, print_parameter_summary, sequence_predictor
 from models.interfaces import build_model, merge_model_config
 from training.encoder_eval import load_case_refs
 from training.losses import image_reconstruction_loss
 from training.sdf_fit import fit_sdf, evaluate_sdf_fit
-from training.train_loop import fit_inr, predict_volume, resolve_device, train_encoder_jointly
+from training.train_loop import build_scheduler, fit_inr, predict_volume, resolve_device, train_encoder_jointly
 from utils.config import load_config
 from utils.io import load_model_weights, save_decoder_weights, save_encoder_weights
 from utils.logging_utils import configure_wandb
@@ -95,13 +110,18 @@ FIELDS = ["point", "case_fraction", "stride", "n_train_cases", "n_train_slices",
 INT_FIELDS = ("stride", "n_train_cases", "n_train_slices", "gt_voxels")
 FLOAT_FIELDS = ("case_fraction", "psnr", "dice", "nsd", "oracle_dice", "native_dice", "native_nsd")
 METRICS = ("native_dice", "dice", "native_nsd", "nsd")
-METHODS = ("floor", "hypernet", "position_only", "ceiling")
-LEARNERS = ("hypernet", "position_only")
+METHODS = ("floor", "hypernet", "position_only", "transformer", "transformer_nocontext", "ceiling")
+SEQUENCE_LEARNERS = ("transformer", "transformer_nocontext")
+LEARNERS = ("hypernet", "position_only") + SEQUENCE_LEARNERS
+# Settings that only pick which cached slices are used or size a learner: no
+# cached encoder or decoder depends on them, so --resume allows changing them.
+RESUME_FREE = ("base_stride", "points", "transformer_dim", "transformer_layers", "transformer_heads")
 DEFAULTS = {
     "split": "train", "test_fraction": None, "split_seed": None,     # None = the hypernet block's
     "axis": 2, "base_stride": 2,
     "encoder_ckpt": None, "encoder_slices": 512, "encoder_steps": 5000,
     "decoder_steps": 500, "points_per_step": 16384, "use_position": True,
+    "transformer_dim": 512, "transformer_layers": 6, "transformer_heads": 4,
     "points": [[1.0, 16], [1.0, 8], [1.0, 4], [1.0, 2], [0.25, 2], [0.5, 2]],
 }
 
@@ -198,6 +218,12 @@ def main():
         raise SystemExit(f"slices.points strides {bad} are not multiples of slices.base_stride={base_stride}.")
     if "position_only" in methods and not scfg["use_position"]:
         raise SystemExit("position_only needs slices.use_position: true (it would see no input at all).")
+    sequence_methods = sorted(methods & set(SEQUENCE_LEARNERS))
+    if sequence_methods and not scfg["use_position"]:
+        raise SystemExit(f"{sequence_methods} need slices.use_position: true (the slice order).")
+    if sequence_methods and not any(s == 1 for _, s in points):
+        raise SystemExit(f"{sequence_methods} train on whole stacks: set slices.base_stride: 1 and add a "
+                         f"stride-1 point to slices.points, e.g. [1.0, 1].")
     out_dir = Path(args.out_dir)
 
     # Cases and split (by case, as experiments/hypernet).
@@ -207,7 +233,9 @@ def main():
     setup = {"data": cfg["data"], "model": cfg["model"], "sdf": sdf_cfg, "slices": scfg, "split": split,
              "seed": args.seed}
     saved = out_dir / "config.json"
-    if args.resume and saved.exists() and json.loads(saved.read_text()) != json.loads(json.dumps(setup)):
+    comparable = lambda c: {**c, "slices": {k: v for k, v in c["slices"].items() if k not in RESUME_FREE}}
+    if args.resume and saved.exists() and \
+            comparable(json.loads(saved.read_text())) != comparable(json.loads(json.dumps(setup))):
         raise SystemExit(f"{saved} was written with different settings; choose another --out_dir.")
     out_dir.mkdir(parents=True, exist_ok=True)
     saved.write_text(json.dumps(setup, indent=2))
@@ -281,7 +309,8 @@ def main():
                                    fit_image(sl["image"][:, m:m + 1], sl["shape"]))
                 extra = torch.tensor([sl["position"]]) if scfg["use_position"] else torch.zeros(0)
                 inputs.append({"input": f"{case_id}/{modality}", "key": key, "case_id": case_id, "k": k,
-                               "modality": modality, "task": case["task"], "x": torch.cat([x, extra])})
+                               "modality": modality, "task": case["task"], "position": sl["position"],
+                               "x": torch.cat([x, extra])})
             done_slices += 1
             if done_slices % 50 == 0 or done_slices == n_slices:
                 print(f"  [{done_slices}/{n_slices}] slices")
@@ -395,13 +424,30 @@ def main():
 
         for method in learners:
             # Same starting decoder as in experiments/hypernet: the floor, or a fresh init.
+            origins = (torch.stack([floors[label] for label in labels]) if lcfg["init_from_floor"]
+                       else fresh.expand(len(labels), -1))
+            if method in SEQUENCE_LEARNERS:
+                if stride != 1:
+                    print(f"  {method}: skipped (whole stacks, stride-1 points only)")
+                    continue
+                tokens = torch.stack([i["x"][:-1] for i in {i["key"]: i for i in train_items}.values()])
+                torch.manual_seed(args.seed)
+                net = SliceTransformer(tokens.shape[1], layout.numel, len(labels), scfg["transformer_dim"],
+                                       scfg["transformer_layers"], scfg["transformer_heads"], lcfg["activation"],
+                                       lcfg["dropout"], context=method == "transformer").to(device)
+                print_parameter_summary(net, f"{point} {method}")
+                torch.manual_seed(args.seed)
+                net.set_reference(tokens.to(device), origins.to(device), scale.to(device))
+                del tokens
+                train_sequence(net, model, layout, train_items, test_items, cfg, lcfg, spacing_mm, device,
+                               on_log(f"{point}/{method}"))
+                score_inputs(meta, method, sequence_predictor(net, test_items, device))
+                continue
             # position_only differs from hypernet only in its input: the decoder part zeroed.
             view = (lambda x: x) if method == "hypernet" else \
                 (lambda x: torch.cat([torch.zeros_like(x[:-1]), x[-1:]]))
             train_m = [{**i, "x": view(i["x"])} for i in train_items]
             test_m = [{**i, "x": view(i["x"])} for i in test_items]
-            origins = (torch.stack([floors[label] for label in labels]) if lcfg["init_from_floor"]
-                       else fresh.expand(len(labels), -1))
             train_x = torch.stack([i["x"] for i in {i["key"]: i for i in train_m}.values()])
             torch.manual_seed(args.seed)
             hyper = HyperMLP(train_x.shape[1], layout.numel, len(labels), lcfg["hidden_dim"], lcfg["layers"],
@@ -418,6 +464,31 @@ def main():
     report(read_rows([results], INT_FIELDS, FLOAT_FIELDS, FIELDS), out_dir, wandb_run)
     if wandb_run is not None:
         wandb_run.finish()
+
+
+def train_sequence(net, model, layout, train_items, test_items, cfg, lcfg, spacing_mm, device, on_log):
+    """train_hypernet for a SliceTransformer: the same optimizer, scheduler,
+    steps, items and points per step and loss; each step runs the chosen
+    items' whole sequences (experiments/slices/transformer.sequence_predictor)."""
+    optimizer = torch.optim.AdamW(net.param_groups(lcfg["weight_decay"]), lr=lcfg["lr"])
+    scheduler = build_scheduler(optimizer, {"name": lcfg["scheduler"]}, lcfg["steps"])
+
+    def params_for(items, eval_mode):
+        predict = sequence_predictor(net, items, device)
+
+        def run(chosen):
+            was_training = net.training
+            net.train(not eval_mode and was_training)
+            out = [layout.unflatten(v) for v in predict([items[i] for i in chosen])]
+            net.train(was_training)
+            return out
+        return run
+
+    net.train()
+    train_weights(model, train_items, params_for(train_items, False), optimizer, scheduler, lcfg["steps"],
+                  lcfg["cases_per_step"], lcfg["points_per_step"], cfg["sdf"], spacing_mm, device,
+                  lcfg["log_every"], on_log, test_items, params_for(test_items, True))
+    net.eval()
 
 
 def report(rows: list, out_dir: Path, wandb_run):
