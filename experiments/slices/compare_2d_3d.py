@@ -18,10 +18,17 @@ are printed alongside for context.
 
 The 2D point defaults to the one trained on the most slices.
 
+With --baseline2d / --baseline3d (e.g. position_only and floor: the image-blind
+baseline of each), it also compares what the image adds: per case,
+gain = method - baseline in each experiment, then gain_2d - gain_3d, paired
+the same way. gain_2d > gain_3d means the 2D learner gets more out of the
+image than the 3D one, not just a better representation or positional prior.
+
 Usage:
   python -m experiments.slices.compare_2d_3d \\
       --slices results/slices/results.csv --volume checkpoints/<decoders>_hypernet/results.csv \\
       [--point cases1_stride2] [--method2d hypernet] [--method3d hypernet] [--out results/compare_2d_3d]
+      [--baseline2d position_only --baseline3d floor]
 """
 import argparse
 import math
@@ -58,14 +65,15 @@ def bootstrap_ci(diffs: np.ndarray, n_boot: int = 10000, seed: int = 0) -> tuple
     return float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
 
 
-def compare(rows_2d: list, rows_3d: list, metrics=METRICS) -> tuple:
-    """(stats rows, per-case rows) for every (label, metric)."""
+def compare_values(a: dict, b: dict) -> tuple:
+    """(stats rows, per-case rows) for {metric: case_values} dicts a and b,
+    per (label, metric), paired over shared keys."""
     stats, cases = [], []
-    for metric in metrics:
-        a, b = case_values(rows_2d, metric), case_values(rows_3d, metric)
-        for label in sorted({k[1] for k in a} & {k[1] for k in b}, key=lambda l: (l != "all", l)):
-            keys = sorted(k for k in set(a) & set(b) if k[1] == label)
-            x, y = np.array([a[k] for k in keys]), np.array([b[k] for k in keys])
+    for metric in a:
+        va, vb = a[metric], b[metric]
+        for label in sorted({k[1] for k in va} & {k[1] for k in vb}, key=lambda l: (l != "all", l)):
+            keys = sorted(k for k in set(va) & set(vb) if k[1] == label)
+            x, y = np.array([va[k] for k in keys]), np.array([vb[k] for k in keys])
             d = x - y
             lo, hi = bootstrap_ci(d)
             stats.append({"metric": metric, "label": label, "n": len(keys),
@@ -73,17 +81,43 @@ def compare(rows_2d: list, rows_3d: list, metrics=METRICS) -> tuple:
                           "mean_diff": float(d.mean()), "ci_low": lo, "ci_high": hi,
                           "wins_2d": int((d > 0).sum()), "wins_3d": int((d < 0).sum()),
                           "ties": int((d == 0).sum()), **paired_wilcoxon(list(x), list(y))})
-            cases += [{"metric": metric, "label": label, "case_id": k[0], "value_2d": a[k], "value_3d": b[k],
-                       "diff": a[k] - b[k]} for k in keys]
+            cases += [{"metric": metric, "label": label, "case_id": k[0], "value_2d": va[k], "value_3d": vb[k],
+                       "diff": va[k] - vb[k]} for k in keys]
     for row, p in zip(stats, holm_adjust([r["p"] for r in stats])):
         row["p_holm"] = p
     return stats, cases
 
 
-def verdict(row: dict, alpha: float = 0.05) -> str:
+def compare(rows_2d: list, rows_3d: list, metrics=METRICS) -> tuple:
+    """(stats rows, per-case rows) for every (label, metric)."""
+    return compare_values({m: case_values(rows_2d, m) for m in metrics},
+                          {m: case_values(rows_3d, m) for m in metrics})
+
+
+def gains(rows: list, base_rows: list, metrics=METRICS) -> dict:
+    """{metric: {(case_id, label): method - baseline}} over keys both have."""
+    out = {}
+    for m in metrics:
+        a, b = case_values(rows, m), case_values(base_rows, m)
+        out[m] = {k: a[k] - b[k] for k in set(a) & set(b)}
+    return out
+
+
+def verdict(row: dict, alpha: float = 0.05, names=("2D", "3D")) -> str:
     if math.isnan(row["p_holm"]) or row["p_holm"] >= alpha:
         return "no significant difference"
-    return "2D better" if row["mean_diff"] > 0 else "3D better"
+    return f"{names[0] if row['mean_diff'] > 0 else names[1]} higher"
+
+
+def print_table(title: str, stats: list, alpha: float, names=("2D", "3D")):
+    print(f"\n==== {title} (Holm over all {len(stats)} tests) ====")
+    a, b = names
+    print(f"  {'metric':<12}{'label':<12}{'n':>4}{a:>8}{b:>8}{'diff':>9}{'95% CI':>20}"
+          f"{'wins':>12}{'p_holm':>10}  verdict")
+    for r in stats:
+        print(f"  {r['metric']:<12}{r['label']:<12}{r['n']:>4}{r['mean_2d']:>8.4f}{r['mean_3d']:>8.4f}"
+              f"{r['mean_diff']:>+9.4f}   [{r['ci_low']:+.4f}, {r['ci_high']:+.4f}]"
+              f"{r['wins_2d']:>6}/{r['wins_3d']:<5}{r['p_holm']:>10.3g}  {verdict(r, alpha, names)}")
 
 
 def main():
@@ -95,6 +129,8 @@ def main():
     parser.add_argument("--method3d", default="hypernet")
     parser.add_argument("--metrics", nargs="+", default=list(METRICS), choices=METRICS)
     parser.add_argument("--alpha", type=float, default=0.05)
+    parser.add_argument("--baseline2d", default=None, help="2D image-blind baseline, e.g. position_only")
+    parser.add_argument("--baseline3d", default=None, help="3D image-blind baseline, e.g. floor")
     parser.add_argument("--out", default=None, help="Prefix for <out>_stats.csv and <out>_cases.csv")
     args = parser.parse_args()
 
@@ -131,13 +167,28 @@ def main():
     rows_3d = [r for r in rows_3d if r["case_id"] in shared]
 
     stats, cases = compare(rows_2d, rows_3d, args.metrics)
-    print(f"\n==== 2D - 3D, paired over test cases (Holm over all {len(stats)} tests) ====")
-    print(f"  {'metric':<12}{'label':<12}{'n':>4}{'2D':>8}{'3D':>8}{'diff':>9}{'95% CI':>20}"
-          f"{'2D/3D wins':>12}{'p_holm':>10}  verdict")
-    for r in stats:
-        print(f"  {r['metric']:<12}{r['label']:<12}{r['n']:>4}{r['mean_2d']:>8.4f}{r['mean_3d']:>8.4f}"
-              f"{r['mean_diff']:>+9.4f}   [{r['ci_low']:+.4f}, {r['ci_high']:+.4f}]"
-              f"{r['wins_2d']:>6}/{r['wins_3d']:<5}{r['p_holm']:>10.3g}  {verdict(r, args.alpha)}")
+    print_table("2D - 3D, paired over test cases", stats, args.alpha)
+
+    gain_stats = []
+    if args.baseline2d or args.baseline3d:
+        if not (args.baseline2d and args.baseline3d):
+            raise SystemExit("Give both --baseline2d and --baseline3d.")
+        base_2d = [r for r in all_2d if r["method"] == args.baseline2d and r["point"] == point
+                   and r["case_id"] in shared]
+        base_3d = [r for r in all_3d if r["method"] == args.baseline3d and r["case_id"] in shared]
+        if not base_2d or not base_3d:
+            raise SystemExit(f"Missing baseline rows: {len(base_2d)} {args.baseline2d!r} at {point} in 2D, "
+                             f"{len(base_3d)} {args.baseline3d!r} in 3D.")
+        g2d, g3d = gains(rows_2d, base_2d, args.metrics), gains(rows_3d, base_3d, args.metrics)
+        for name, rows, base_rows, method, base in (
+                ("2D", rows_2d, base_2d, args.method2d, args.baseline2d),
+                ("3D", rows_3d, base_3d, args.method3d, args.baseline3d)):
+            within, _ = compare(rows, base_rows, args.metrics)
+            print_table(f"{name}: {method} - {base} (what the image adds in {name})", within, args.alpha,
+                        ("method", "base"))
+        gain_stats, gain_cases = compare_values(g2d, g3d)
+        print_table(f"gain 2D - gain 3D ({args.method2d} - {args.baseline2d} vs {args.method3d} - "
+                    f"{args.baseline3d})", gain_stats, args.alpha, ("gain2D", "gain3D"))
 
     for name, rows, method in (("2D", all_2d, "ceiling"), ("3D", all_3d, "ceiling")):
         ceiling = [r for r in rows if r["method"] == method and r["case_id"] in shared]
@@ -149,7 +200,12 @@ def main():
     if args.out:
         write_csv(Path(f"{args.out}_stats.csv"), [{**r, "verdict": verdict(r, args.alpha)} for r in stats])
         write_csv(Path(f"{args.out}_cases.csv"), cases)
-        print(f"\nWrote {args.out}_stats.csv and {args.out}_cases.csv")
+        if gain_stats:
+            write_csv(Path(f"{args.out}_gain_stats.csv"),
+                      [{**r, "verdict": verdict(r, args.alpha)} for r in gain_stats])
+            write_csv(Path(f"{args.out}_gain_cases.csv"), gain_cases)
+        print(f"\nWrote {args.out}_stats.csv, {args.out}_cases.csv" +
+              (f", {args.out}_gain_stats.csv, {args.out}_gain_cases.csv" if gain_stats else ""))
 
 
 if __name__ == "__main__":

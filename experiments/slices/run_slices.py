@@ -13,6 +13,12 @@ information, for data-hungry learners such as transformers. Methods:
             slice's position in its volume, k / (n_slices - 1)
             (slices.use_position): relative to the whole volume, so it
             carries no ground-truth information
+  position_only  the hypernet ablation: the same model, seed, init and
+            training with the intensity-decoder input zeroed, so it sees
+            only the label and the slice position -- a positional atlas, the
+            2D counterpart of the 3D floor (which knows z through its
+            coordinates). hypernet - position_only is what the image adds.
+            Needs slices.use_position.
   ceiling   each test slice's own fitted SDF decoder (test slices only)
 For scoring, each test case's predicted slices are stacked back into its
 volume and scored exactly like the 3D experiment -- resampled and native
@@ -52,7 +58,12 @@ summary_per_label.csv. WandB: training curves, per-point summaries, tables.
 
 Usage:
   python -m experiments.slices.run_slices --config config/training_config.yaml \\
-      --out_dir results/slices [--methods floor hypernet ceiling] [--resume]
+      --out_dir results/slices [--methods floor hypernet position_only ceiling] [--resume]
+
+  Adding a method to an existing run: the same --out_dir with --resume reuses
+  the encoder, the slice decoders and every result already written; --points
+  limits the run to some learning-curve points, e.g.
+    ... --methods position_only --points cases1_stride2 --resume
 """
 import argparse
 import json
@@ -84,7 +95,8 @@ FIELDS = ["point", "case_fraction", "stride", "n_train_cases", "n_train_slices",
 INT_FIELDS = ("stride", "n_train_cases", "n_train_slices", "gt_voxels")
 FLOAT_FIELDS = ("case_fraction", "psnr", "dice", "nsd", "oracle_dice", "native_dice", "native_nsd")
 METRICS = ("native_dice", "dice", "native_nsd", "nsd")
-METHODS = ("floor", "hypernet", "ceiling")
+METHODS = ("floor", "hypernet", "position_only", "ceiling")
+LEARNERS = ("hypernet", "position_only")
 DEFAULTS = {
     "split": "train", "test_fraction": None, "split_seed": None,     # None = the hypernet block's
     "axis": 2, "base_stride": 2,
@@ -160,6 +172,8 @@ def main():
     parser.add_argument("--out_dir", required=True)
     parser.add_argument("--methods", nargs="+", choices=METHODS, default=list(METHODS))
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--points", nargs="+", default=None,
+                        help="Run only these learning-curve points, e.g. cases1_stride2 (default: all)")
     parser.add_argument("--resume", action="store_true",
                         help="Skip (point, method, input) results already in results.csv")
     args = parser.parse_args()
@@ -182,6 +196,8 @@ def main():
     bad = [s for _, s in points if s % base_stride]
     if bad:
         raise SystemExit(f"slices.points strides {bad} are not multiples of slices.base_stride={base_stride}.")
+    if "position_only" in methods and not scfg["use_position"]:
+        raise SystemExit("position_only needs slices.use_position: true (it would see no input at all).")
     out_dir = Path(args.out_dir)
 
     # Cases and split (by case, as experiments/hypernet).
@@ -351,6 +367,8 @@ def main():
         train_items = input_items(subset, stride)
         n_train_slices = sum(1 for c in subset for k in cases[c]["slices"] if k % stride == 0)
         point = f"cases{fraction:g}_stride{stride}"
+        if args.points and point not in args.points:
+            continue
         meta = {"point": point, "case_fraction": fraction, "stride": stride, "n_train_cases": len(subset),
                 "n_train_slices": n_train_slices}
         print(f"\n==== {point}: {len(subset)} training cases, {n_train_slices} slices, "
@@ -363,7 +381,8 @@ def main():
                                      for p in parts[(c, k)] if p["label"] == label]
 
         floors = {}
-        if "floor" in methods or ("hypernet" in methods and lcfg["init_from_floor"]):
+        learners = [m for m in LEARNERS if m in methods]
+        if "floor" in methods or (learners and lcfg["init_from_floor"]):
             for label in labels:
                 torch.manual_seed(args.seed)
                 floors[label] = train_floor(model, layout, label_parts(label), [], cfg, lcfg, spacing_mm,
@@ -374,21 +393,26 @@ def main():
                     record(meta, "floor", case_id,
                            score(case_id, lambda k, part: layout.unflatten(floors[part["label"]])))
 
-        if "hypernet" in methods:
+        for method in learners:
             # Same starting decoder as in experiments/hypernet: the floor, or a fresh init.
+            # position_only differs from hypernet only in its input: the decoder part zeroed.
+            view = (lambda x: x) if method == "hypernet" else \
+                (lambda x: torch.cat([torch.zeros_like(x[:-1]), x[-1:]]))
+            train_m = [{**i, "x": view(i["x"])} for i in train_items]
+            test_m = [{**i, "x": view(i["x"])} for i in test_items]
             origins = (torch.stack([floors[label] for label in labels]) if lcfg["init_from_floor"]
                        else fresh.expand(len(labels), -1))
-            train_x = torch.stack([i["x"] for i in {i["key"]: i for i in train_items}.values()])
+            train_x = torch.stack([i["x"] for i in {i["key"]: i for i in train_m}.values()])
             torch.manual_seed(args.seed)
             hyper = HyperMLP(train_x.shape[1], layout.numel, len(labels), lcfg["hidden_dim"], lcfg["layers"],
                              lcfg["activation"], lcfg["norm"], lcfg["dropout"]).to(device)
-            print_hypernet_summary(hyper, train_x.shape[1], f"{point} hypernet")
+            print_hypernet_summary(hyper, train_x.shape[1], f"{point} {method}")
             torch.manual_seed(args.seed)
             hyper.set_reference(train_x.to(device), origins.to(device), scale.to(device))
-            train_hypernet(hyper, model, layout, train_items, test_items, cfg, lcfg, spacing_mm, device,
-                           on_log(f"{point}/hypernet"))
-            score_inputs(meta, "hypernet", lambda items: hyper(
-                torch.stack([i["x"] for i in items]).to(device),
+            train_hypernet(hyper, model, layout, train_m, test_m, cfg, lcfg, spacing_mm, device,
+                           on_log(f"{point}/{method}"))
+            score_inputs(meta, method, lambda items: hyper(
+                torch.stack([view(i["x"]) for i in items]).to(device),
                 torch.tensor([i["label_index"] for i in items], device=device)))
 
     report(read_rows([results], INT_FIELDS, FLOAT_FIELDS, FIELDS), out_dir, wandb_run)

@@ -2,7 +2,7 @@ import math
 import subprocess
 import sys
 
-from experiments.slices.compare_2d_3d import case_values, compare
+from experiments.slices.compare_2d_3d import case_values, compare, gains
 from utils.results_io import RowWriter, read_rows
 
 METRIC_FIELDS = ("dice", "nsd", "native_dice", "native_nsd")
@@ -52,3 +52,30 @@ def test_cli_reports_on_shared_cases_only(tmp_path):
     assert "5 shared" in out and "WARNING: the test sets differ" in out
     stats = read_rows([tmp_path / "cmp_stats.csv"], ("n",), ("mean_diff",))
     assert stats[0]["n"] == 5 and math.isclose(stats[0]["mean_diff"], 0.1)
+
+
+def test_gains_subtract_the_baseline_per_case_and_label():
+    rows = [_row("hypernet", f"c{i}", "A", 0.8) for i in range(3)]
+    base = [_row("position_only", f"c{i}", "A", 0.5 + 0.1 * i) for i in range(3)]
+    g = gains(rows, base, ("dice",))["dice"]
+    assert math.isclose(g[("c0", "A")], 0.3) and math.isclose(g[("c2", "all")], 0.1)
+
+
+def test_cli_compares_what_the_image_adds(tmp_path):
+    fields_2d = ["point", "n_train_cases", "n_train_slices", "method", "case_id", "input", "task",
+                 "modality", "label", *METRIC_FIELDS]
+    fields_3d = ["method", "case_id", "input", "task", "modality", "label", *METRIC_FIELDS]
+    meta = {"point": "cases1_stride2", "n_train_cases": 10, "n_train_slices": 100}
+    rows_2d = [_row(m, f"c{i}", "A", v + 0.001 * i, **meta)
+               for i in range(8) for m, v in (("hypernet", 0.8), ("position_only", 0.7))]
+    rows_3d = [_row(m, f"c{i}", "A", v + 0.001 * i)
+               for i in range(8) for m, v in (("hypernet", 0.7), ("floor", 0.3))]
+    RowWriter(tmp_path / "2d.csv", fields_2d, False).write(rows_2d)
+    RowWriter(tmp_path / "3d.csv", fields_3d, False).write(rows_3d)
+    out = subprocess.run([sys.executable, "-m", "experiments.slices.compare_2d_3d", "--slices",
+                          str(tmp_path / "2d.csv"), "--volume", str(tmp_path / "3d.csv"), "--metrics", "dice",
+                          "--baseline2d", "position_only", "--baseline3d", "floor", "--out", str(tmp_path / "cmp")],
+                         capture_output=True, text=True, check=True).stdout
+    assert "what the image adds in 2D" in out and "gain 2D - gain 3D" in out
+    gain = read_rows([tmp_path / "cmp_gain_stats.csv"], ("n",), ("mean_diff",))
+    assert gain[0]["n"] == 8 and math.isclose(gain[0]["mean_diff"], 0.1 - 0.4)   # 3D gains more here
