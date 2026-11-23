@@ -19,12 +19,6 @@ information, for data-hungry learners such as transformers. Methods:
             2D counterpart of the 3D floor (which knows z through its
             coordinates). hypernet - position_only is what the image adds.
             Needs slices.use_position.
-  atlas_residual  a positional atlas plus an image residual, trained jointly
-            in one model with the hypernet's settings and steps
-            (experiments/slices/model.py): the atlas branch sees the
-            position, the image branch the hypernet's input, and the image
-            branch is dropped per item with slices.image_dropout so the atlas
-            learns to stand alone. Needs slices.use_position.
   ceiling   each test slice's own fitted SDF decoder (test slices only)
 For scoring, each test case's predicted slices are stacked back into its
 volume and scored exactly like the 3D experiment -- resampled and native
@@ -64,7 +58,7 @@ summary_per_label.csv. WandB: training curves, per-point summaries, tables.
 
 Usage:
   python -m experiments.slices.run_slices --config config/training_config.yaml \\
-      --out_dir results/slices [--methods floor hypernet position_only atlas_residual ceiling] [--resume]
+      --out_dir results/slices [--methods floor hypernet position_only ceiling] [--resume]
 
   Adding a method to an existing run: the same --out_dir with --resume reuses
   the encoder, the slice decoders and every result already written; --points
@@ -83,7 +77,6 @@ from experiments.hypernet.data import split_cases, label_targets
 from experiments.hypernet.model import HeadLayout, HyperMLP, flatten_state_dict, load_head, print_hypernet_summary
 from experiments.hypernet.run_hypernet import DEFAULTS as HYPERNET_DEFAULTS, train_floor, train_hypernet
 from experiments.slices.data import load_slice_cases, put_slice
-from experiments.slices.model import AtlasResidual
 from models.interfaces import build_model, merge_model_config
 from training.encoder_eval import load_case_refs
 from training.losses import image_reconstruction_loss
@@ -102,16 +95,13 @@ FIELDS = ["point", "case_fraction", "stride", "n_train_cases", "n_train_slices",
 INT_FIELDS = ("stride", "n_train_cases", "n_train_slices", "gt_voxels")
 FLOAT_FIELDS = ("case_fraction", "psnr", "dice", "nsd", "oracle_dice", "native_dice", "native_nsd")
 METRICS = ("native_dice", "dice", "native_nsd", "nsd")
-METHODS = ("floor", "hypernet", "position_only", "atlas_residual", "ceiling")
-LEARNERS = ("hypernet", "position_only", "atlas_residual")
-# Learner-only settings: they change no cached encoder or decoder, so the
-# --resume check ignores them (new methods can join an existing run).
-LEARNER_KEYS = ("image_dropout",)
+METHODS = ("floor", "hypernet", "position_only", "ceiling")
+LEARNERS = ("hypernet", "position_only")
 DEFAULTS = {
     "split": "train", "test_fraction": None, "split_seed": None,     # None = the hypernet block's
     "axis": 2, "base_stride": 2,
     "encoder_ckpt": None, "encoder_slices": 512, "encoder_steps": 5000,
-    "decoder_steps": 500, "points_per_step": 16384, "use_position": True, "image_dropout": 0.5,
+    "decoder_steps": 500, "points_per_step": 16384, "use_position": True,
     "points": [[1.0, 16], [1.0, 8], [1.0, 4], [1.0, 2], [0.25, 2], [0.5, 2]],
 }
 
@@ -206,9 +196,8 @@ def main():
     bad = [s for _, s in points if s % base_stride]
     if bad:
         raise SystemExit(f"slices.points strides {bad} are not multiples of slices.base_stride={base_stride}.")
-    needs_position = sorted(methods & {"position_only", "atlas_residual"})
-    if needs_position and not scfg["use_position"]:
-        raise SystemExit(f"{needs_position} need slices.use_position: true.")
+    if "position_only" in methods and not scfg["use_position"]:
+        raise SystemExit("position_only needs slices.use_position: true (it would see no input at all).")
     out_dir = Path(args.out_dir)
 
     # Cases and split (by case, as experiments/hypernet).
@@ -218,9 +207,7 @@ def main():
     setup = {"data": cfg["data"], "model": cfg["model"], "sdf": sdf_cfg, "slices": scfg, "split": split,
              "seed": args.seed}
     saved = out_dir / "config.json"
-    comparable = lambda c: {**c, "slices": {k: v for k, v in c["slices"].items() if k not in LEARNER_KEYS}}
-    if args.resume and saved.exists() and \
-            comparable(json.loads(saved.read_text())) != comparable(json.loads(json.dumps(setup))):
+    if args.resume and saved.exists() and json.loads(saved.read_text()) != json.loads(json.dumps(setup)):
         raise SystemExit(f"{saved} was written with different settings; choose another --out_dir.")
     out_dir.mkdir(parents=True, exist_ok=True)
     saved.write_text(json.dumps(setup, indent=2))
@@ -409,18 +396,16 @@ def main():
         for method in learners:
             # Same starting decoder as in experiments/hypernet: the floor, or a fresh init.
             # position_only differs from hypernet only in its input: the decoder part zeroed.
-            view = (lambda x: torch.cat([torch.zeros_like(x[:-1]), x[-1:]])) if method == "position_only" \
-                else (lambda x: x)
+            view = (lambda x: x) if method == "hypernet" else \
+                (lambda x: torch.cat([torch.zeros_like(x[:-1]), x[-1:]]))
             train_m = [{**i, "x": view(i["x"])} for i in train_items]
             test_m = [{**i, "x": view(i["x"])} for i in test_items]
             origins = (torch.stack([floors[label] for label in labels]) if lcfg["init_from_floor"]
                        else fresh.expand(len(labels), -1))
             train_x = torch.stack([i["x"] for i in {i["key"]: i for i in train_m}.values()])
             torch.manual_seed(args.seed)
-            mlp_args = (train_x.shape[1], layout.numel, len(labels), lcfg["hidden_dim"], lcfg["layers"],
-                        lcfg["activation"], lcfg["norm"], lcfg["dropout"])
-            hyper = (AtlasResidual(*mlp_args, image_dropout=scfg["image_dropout"])
-                     if method == "atlas_residual" else HyperMLP(*mlp_args)).to(device)
+            hyper = HyperMLP(train_x.shape[1], layout.numel, len(labels), lcfg["hidden_dim"], lcfg["layers"],
+                             lcfg["activation"], lcfg["norm"], lcfg["dropout"]).to(device)
             print_hypernet_summary(hyper, train_x.shape[1], f"{point} {method}")
             torch.manual_seed(args.seed)
             hyper.set_reference(train_x.to(device), origins.to(device), scale.to(device))
