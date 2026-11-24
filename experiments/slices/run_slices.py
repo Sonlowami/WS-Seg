@@ -23,8 +23,9 @@ information, for data-hungry learners such as transformers. Methods:
             slice's SDF decoder from the whole stack of its volume's slice
             intensity decoders (raw tokens + Fourier position + label
             embedding, slices.transformer_dim / _layers / _heads), with the
-            hypernet block's dropout, optimizer, steps, items and points per
-            step and floor start. Trained and scored on whole stacks, so only
+            hypernet block's optimizer, steps, items and points per step,
+            floor start, and its dropout and weight decay unless
+            slices.transformer_dropout / transformer_weight_decay are set. Trained and scored on whole stacks, so only
             at stride-1 points (slices.base_stride: 1). No augmentation.
   transformer_nocontext  the same model with each token attending only to
             itself: transformer - transformer_nocontext is what context adds.
@@ -73,8 +74,11 @@ Usage:
   the encoder, the slice decoders and every result already written; --points
   limits the run to some learning-curve points, e.g.
     ... --methods position_only --points cases1_stride2 --resume
-  base_stride, points and the transformer sizes may change between resumed
-  runs: they pick which cached slices are used, not how any decoder is fitted.
+  base_stride and points may change between resumed runs: they pick which
+  cached slices are used, not how any decoder is fitted. A method whose test
+  inputs are all scored at a point is not retrained, and a resumed run stops
+  if a method's settings differ from those its rows were scored with
+  (learner_settings.json), so other settings need another --out_dir.
   The transformer, e.g. (slices.base_stride: 1, a point [1.0, 1]):
     ... --methods transformer transformer_nocontext --points cases1_stride1 --resume
 """
@@ -91,6 +95,8 @@ from experiments.hypernet.model import HeadLayout, HyperMLP, flatten_state_dict,
 from experiments.hypernet.run_hypernet import DEFAULTS as HYPERNET_DEFAULTS, train_floor, train_hypernet
 from experiments.hypernet.train import train_weights
 from experiments.slices.data import load_slice_cases, put_slice
+from experiments.slices.resume import (SEQUENCE_LEARNERS, SEQUENCE_OVERRIDES, SEQUENCE_SIZES, check_settings,
+                                       record_settings, sequence_config)
 from experiments.slices.transformer import SliceTransformer, print_parameter_summary, sequence_predictor
 from models.interfaces import build_model, merge_model_config
 from training.encoder_eval import load_case_refs
@@ -111,17 +117,18 @@ INT_FIELDS = ("stride", "n_train_cases", "n_train_slices", "gt_voxels")
 FLOAT_FIELDS = ("case_fraction", "psnr", "dice", "nsd", "oracle_dice", "native_dice", "native_nsd")
 METRICS = ("native_dice", "dice", "native_nsd", "nsd")
 METHODS = ("floor", "hypernet", "position_only", "transformer", "transformer_nocontext", "ceiling")
-SEQUENCE_LEARNERS = ("transformer", "transformer_nocontext")
 LEARNERS = ("hypernet", "position_only") + SEQUENCE_LEARNERS
-# Settings that only pick which cached slices are used or size a learner: no
-# cached encoder or decoder depends on them, so --resume allows changing them.
-RESUME_FREE = ("base_stride", "points", "transformer_dim", "transformer_layers", "transformer_heads")
+# No cached encoder or decoder depends on these, so --resume lets them differ
+# from config.json. The learners' own settings are checked per method instead
+# (experiments/slices/resume.py).
+RESUME_FREE = ("base_stride", "points") + SEQUENCE_SIZES + tuple(SEQUENCE_OVERRIDES)
 DEFAULTS = {
     "split": "train", "test_fraction": None, "split_seed": None,     # None = the hypernet block's
     "axis": 2, "base_stride": 2,
     "encoder_ckpt": None, "encoder_slices": 512, "encoder_steps": 5000,
     "decoder_steps": 500, "points_per_step": 16384, "use_position": True,
     "transformer_dim": 512, "transformer_layers": 6, "transformer_heads": 4,
+    "transformer_dropout": None, "transformer_weight_decay": None,   # None = the hypernet block's
     "points": [[1.0, 16], [1.0, 8], [1.0, 4], [1.0, 2], [0.25, 2], [0.5, 2]],
 }
 
@@ -237,6 +244,12 @@ def main():
     if args.resume and saved.exists() and \
             comparable(json.loads(saved.read_text())) != comparable(json.loads(json.dumps(setup))):
         raise SystemExit(f"{saved} was written with different settings; choose another --out_dir.")
+    results = out_dir / "results.csv"
+    done = {(r["point"], r["method"], r["input"] or r["case_id"]) for r in read_rows([results], fieldnames=FIELDS)} \
+        if args.resume and results.exists() else set()
+    run_points = [p for p in (f"cases{f:g}_stride{s}" for f, s in points) if not args.points or p in args.points]
+    check_settings(out_dir, done, run_points, sorted(methods - {"ceiling"}), scfg, lcfg,
+                   json.loads(saved.read_text())["slices"] if saved.exists() else {})
     out_dir.mkdir(parents=True, exist_ok=True)
     saved.write_text(json.dumps(setup, indent=2))
     (out_dir / "split.json").write_text(json.dumps(split, indent=2))
@@ -244,7 +257,8 @@ def main():
     cases = load_slice_cases(cfg["data"], sdf_cfg["label_groups"], scfg["split"], set(case_ids), test_ids,
                              spacing_mm, alpha, axis, lambda c: 1 if c in test_ids else base_stride)
 
-    wandb_run = configure_wandb(cfg["wandb"], f"{cfg['experiment_name']}_slices", {**setup, "learner": lcfg})
+    wandb_run = configure_wandb(cfg["wandb"], f"{cfg['experiment_name']}_slices",
+                                {**setup, "learner": lcfg, "learner_sequence": sequence_config(scfg, lcfg)})
     logged_prefixes = set()
 
     def on_log(prefix):
@@ -338,9 +352,7 @@ def main():
     test_items = input_items(test_ids, 1)
 
     # Results.
-    results = out_dir / "results.csv"
-    done = {(r["point"], r["method"], r["input"] or r["case_id"]) for r in read_rows([results], fieldnames=FIELDS)} \
-        if args.resume and results.exists() else set()
+    test_inputs = sorted({i["input"] for i in test_items})
     writer = RowWriter(results, FIELDS, args.resume)
 
     def score(case_id, params_for_slice):
@@ -409,14 +421,25 @@ def main():
         label_parts = lambda label: [p for c in sorted(subset) for k in cases[c]["slices"] if k % stride == 0
                                      for p in parts[(c, k)] if p["label"] == label]
 
+        # What is left to do here: methods not fully scored yet.
+        todo = []
+        for method in (m for m in ("floor",) + LEARNERS if m in methods):
+            ids = sorted(test_ids) if method == "floor" else test_inputs
+            if all((point, method, i) in done for i in ids):
+                print(f"  {method}: already scored, skipped")
+            elif method in SEQUENCE_LEARNERS and stride != 1:
+                print(f"  {method}: skipped (whole stacks, stride-1 points only)")
+            else:
+                todo.append(method)
+                record_settings(out_dir, point, method, scfg, lcfg)
         floors = {}
-        learners = [m for m in LEARNERS if m in methods]
-        if "floor" in methods or (learners and lcfg["init_from_floor"]):
+        learners = [m for m in todo if m != "floor"]
+        if "floor" in todo or (learners and lcfg["init_from_floor"]):
             for label in labels:
                 torch.manual_seed(args.seed)
                 floors[label] = train_floor(model, layout, label_parts(label), [], cfg, lcfg, spacing_mm,
                                             device, on_log(f"{point}/floor/{label}"), fresh)
-        if "floor" in methods:
+        if "floor" in todo:
             for case_id in sorted(test_ids):
                 if (point, "floor", case_id) not in done:
                     record(meta, "floor", case_id,
@@ -427,19 +450,18 @@ def main():
             origins = (torch.stack([floors[label] for label in labels]) if lcfg["init_from_floor"]
                        else fresh.expand(len(labels), -1))
             if method in SEQUENCE_LEARNERS:
-                if stride != 1:
-                    print(f"  {method}: skipped (whole stacks, stride-1 points only)")
-                    continue
+                tcfg = sequence_config(scfg, lcfg)
                 tokens = torch.stack([i["x"][:-1] for i in {i["key"]: i for i in train_items}.values()])
                 torch.manual_seed(args.seed)
                 net = SliceTransformer(tokens.shape[1], layout.numel, len(labels), scfg["transformer_dim"],
-                                       scfg["transformer_layers"], scfg["transformer_heads"], lcfg["activation"],
-                                       lcfg["dropout"], context=method == "transformer").to(device)
-                print_parameter_summary(net, f"{point} {method}")
+                                       scfg["transformer_layers"], scfg["transformer_heads"], tcfg["activation"],
+                                       tcfg["dropout"], context=method == "transformer").to(device)
+                print_parameter_summary(net, f"{point} {method} (dropout {tcfg['dropout']}, "
+                                             f"weight decay {tcfg['weight_decay']})")
                 torch.manual_seed(args.seed)
                 net.set_reference(tokens.to(device), origins.to(device), scale.to(device))
                 del tokens
-                train_sequence(net, model, layout, train_items, test_items, cfg, lcfg, spacing_mm, device,
+                train_sequence(net, model, layout, train_items, test_items, cfg, tcfg, spacing_mm, device,
                                on_log(f"{point}/{method}"))
                 score_inputs(meta, method, sequence_predictor(net, test_items, device))
                 continue
